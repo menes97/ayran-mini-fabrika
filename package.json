@@ -1,0 +1,26 @@
+{
+  "name": "ayran-dolum-sim",
+  "version": "0.1.0",
+  "description": "Ayran mini fabrika simülasyonu (three.js 3D + Modbus TCP, OpenPLC ile kontrol, izleme katmanı: izlenebilirlik ve OEE)",
+  "type": "module",
+  "license": "MIT",
+  "scripts": {
+    "pretest": "node tools/gen-plc.js && node tools/gen-codesys.js",
+    "start": "node server/index.js",
+    "plc": "node plc/js-plc.js",
+    "demo": "node --disable-warning=ExperimentalWarning scripts/demo.js",
+    "test": "node test/codesys-unit.js && node --disable-warning=ExperimentalWarning test/monitor-unit.js && node --disable-warning=ExperimentalWarning test/phase6-unit.js && node --disable-warning=ExperimentalWarning test/smoke.js",
+    "build:plc": "node tools/gen-plc.js",
+    "monitor": "node --disable-warning=ExperimentalWarning monitor/server.js",
+    "demo:3plc": "node --disable-warning=ExperimentalWarning scripts/demo.js --3plc",
+    "build:codesys": "node tools/gen-codesys.js"
+  },
+  "engines": {
+    "node": ">=22.13"
+  },
+  "dependencies": {
+    "modbus-serial": "^8.0.17",
+    "three": "^0.170.0",
+    "ws": "^8.18.0"
+  }
+}

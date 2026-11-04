@@ -1,0 +1,95 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ayran İzleme</title>
+  <link rel="stylesheet" href="panel.css">
+</head>
+<body>
+  <header class="top">
+    <div class="brand">
+      <h1>Ayran Mini Fabrika · İzleme</h1>
+      <div class="sub" id="shift">-</div>
+    </div>
+    <nav id="tabs">
+      <button data-tab="genel" class="on">Genel bakış</button>
+      <button data-tab="durus">Duruşlar</button>
+      <button data-tab="alarm">Alarmlar</button>
+      <button data-tab="palet">Palet izleme</button>
+      <button data-tab="rapor">Vardiya raporu</button>
+    </nav>
+    <div id="status" class="status"></div>
+  </header>
+
+  <main>
+    <!-- ================= Genel bakış ================= -->
+    <section id="tab-genel" class="tab on">
+      <div class="row kpis">
+        <div class="card hero">
+          <div class="label">Hat OEE (darboğaz: dolum) · bu vardiya</div>
+          <div class="hero-body">
+            <svg id="oee-ring" viewBox="0 0 120 120" width="132" height="132"></svg>
+            <div class="apq" id="apq"></div>
+          </div>
+        </div>
+        <div class="card counters" id="counters"></div>
+      </div>
+      <div class="cells" id="cells"></div>
+      <div class="card">
+        <div class="card-head"><h2>Durum zaman çizelgesi</h2><span class="sub">son 60 dakika</span><div class="legend" id="legend"></div></div>
+        <svg id="timeline" class="timeline"></svg>
+      </div>
+      <div class="row two">
+        <div class="card"><h2>Aktif alarmlar</h2><div id="active"></div></div>
+        <div class="card"><h2>Uzlaştırma (PLC sayacı ↔ hat takibi)</h2><div id="reconcile"></div></div>
+      </div>
+    </section>
+
+    <!-- ================= Duruşlar ================= -->
+    <section id="tab-durus" class="tab">
+      <div class="toolbar">
+        <span>Aralık:</span>
+        <button data-win="900">15 dk</button><button data-win="3600" class="on">1 saat</button><button data-win="shift">Vardiya</button>
+      </div>
+      <div class="card"><h2>Kategori dağılımı (hücre başına)</h2><div id="stack"></div></div>
+      <div class="row two">
+        <div class="card"><h2>Dolum kayıp ağacı</h2><div id="losstree"></div></div>
+        <div class="card"><h2>En uzun duruşlar</h2><div id="longest"></div></div>
+      </div>
+    </section>
+
+    <!-- ================= Alarmlar ================= -->
+    <section id="tab-alarm" class="tab">
+      <div class="toolbar">
+        <label><input type="checkbox" id="alarm-all"> Uyarıları da göster</label>
+      </div>
+      <div class="card"><h2>Alarm Pareto'su (son 8 saat)</h2><svg id="pareto" class="pareto"></svg></div>
+      <div class="card"><h2>Alarm geçmişi</h2><div id="history"></div></div>
+    </section>
+
+    <!-- ================= Palet izleme ================= -->
+    <section id="tab-palet" class="tab">
+      <div class="row trace">
+        <div class="card list">
+          <h2>Paletler</h2>
+          <input id="label-search" placeholder="Etiket ara: AY-...-00001" spellcheck="false">
+          <div id="pallets"></div>
+          <h2>Geri çağırma</h2>
+          <div class="sub">Bir CIP dönemindeki ürünü taşıyan paletler</div>
+          <div id="cips"></div>
+          <div id="recall"></div>
+        </div>
+        <div class="card detail" id="pallet-detail"><div class="empty">Soldan bir palet seçin.</div></div>
+      </div>
+    </section>
+
+    <!-- ================= Vardiya raporu ================= -->
+    <section id="tab-rapor" class="tab">
+      <div class="toolbar"><button id="print">Yazdır</button><button id="prev-shift">◀ Önceki vardiya</button><button id="this-shift">Bu vardiya</button></div>
+      <div class="card report" id="report"></div>
+    </section>
+  </main>
+  <script type="module" src="panel.js"></script>
+</body>
+</html>

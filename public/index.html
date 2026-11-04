@@ -1,0 +1,221 @@
+<!doctype html>
+<html lang="tr">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Ayran Mini Fabrika</title>
+  <link rel="stylesheet" href="style.css">
+  <script type="importmap">
+    {
+      "imports": {
+        "three": "/vendor/three/build/three.module.js",
+        "three/addons/": "/vendor/three/examples/jsm/"
+      }
+    }
+  </script>
+</head>
+<body>
+  <div id="viewport"></div>
+
+  <div id="views">
+    <button data-view="overview">Genel</button>
+    <button data-view="fill">Dolum</button>
+    <button data-view="seal">Folyo + kapama</button>
+    <button data-view="reject">Red + çıkış</button>
+    <button data-view="process">Tank + CIP</button>
+    <button data-view="pack">Paketleme</button>
+    <button data-view="palet">Paletleme</button>
+    <button data-view="depo">AGV + depo</button>
+    <button data-view="factory">Fabrika</button>
+    <button id="toggle-panel" title="Paneli gizle/göster (H)">Panel ⇆</button>
+  </div>
+
+  <aside id="panel">
+    <header>
+      <div>
+        <h1>Ayran Mini Fabrika</h1>
+        <div class="sub">Tank + CIP · dolum · shrink · robotlu paletleme · AGV · otomatik depo · OpenPLC / Modbus TCP</div>
+      </div>
+      <div style="display:flex;flex-direction:column;gap:6px;align-items:flex-end">
+        <div id="plc-badge" class="badge off">PLC yok</div>
+        <a id="mon-link" class="badge on" target="_blank" rel="noopener" style="text-decoration:none">İzleme paneli ↗</a>
+      </div>
+    </header>
+
+    <section>
+      <h2>Operatör paneli</h2>
+      <div class="op">
+        <button class="pb start" data-btn="start">START</button>
+        <button class="pb stop" data-btn="stop">STOP</button>
+        <button class="pb reset" data-btn="reset">RESET</button>
+        <button class="estop" id="estop" title="Acil stop">ACİL<br>STOP</button>
+        <div class="tower" aria-label="Kule lambası">
+          <span id="lamp-red"></span><span id="lamp-yellow"></span><span id="lamp-green"></span>
+        </div>
+      </div>
+      <div class="mode-row">Mod: <b id="mode">-</b></div>
+      <ul id="alarms" class="alarms"></ul>
+    </section>
+
+    <section>
+      <h2>Dolum makinesi</h2>
+      <div class="pv">
+        <div><label>Dolum tankı</label><div class="bar"><i id="tank-bar"></i></div><b id="tank">-</b><span></span></div>
+        <div><label>Kapama sıcaklığı</label><div class="bar heat"><i id="temp-bar"></i></div><b id="temp">-</b><span></span></div>
+        <div><label>Dolum terazisi (net)</label><span></span><b id="fill">-</b><span></span></div>
+        <div><label>Kontrol tartısı (brüt)</label><span></span><b id="check">-</b><span></span></div>
+        <div><label>Bardak magazini</label><span></span><b id="cupmag">-</b><button data-refill="cups">Doldur</button></div>
+        <div><label>Folyo magazini</label><span></span><b id="foilmag">-</b><button data-refill="foil">Doldur</button></div>
+        <div><label>Çıkış bandı</label><span></span><b id="outfeed">-</b><span></span></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Tank ve CIP</h2>
+      <div class="cip-ops">
+        <button class="pb cip" data-tbtn="cipStart">CIP BAŞLAT</button>
+        <button class="pb stop" data-tbtn="cipAbort">CIP İPTAL</button>
+      </div>
+      <div class="mode-row">Durum: <b id="tank-state">-</b> <span id="tank-step"></span></div>
+      <ul id="tank-alarms" class="alarms"></ul>
+      <div class="pv">
+        <div><label>T1 üretim tankı</label><div class="bar"><i id="t1-bar"></i></div><b id="t1">-</b><button data-refill="prod">Doldur</button></div>
+        <div><label>Debi FT1</label><span></span><b id="flow">-</b><span></span></div>
+        <div><label>İletkenlik QT1</label><div class="bar cond"><i id="cond-bar"></i></div><b id="cond">-</b><span></span></div>
+        <div><label>Hat dönüş sıcaklığı</label><span></span><b id="ret-t">-</b><span></span></div>
+        <div><label>Kostik tankı</label><div class="bar heat"><i id="cip-bar"></i></div><b id="cip-t">-</b><button data-refill="caustic">Tazele</button></div>
+        <div><label>Son CIP'ten beri</label><div class="bar"><i id="since-bar"></i></div><b id="since">-</b><span></span></div>
+      </div>
+      <div class="cip-report" id="cip-report"></div>
+    </section>
+
+    <section>
+      <h2>Paketleme: gruplama, sarma, fırın</h2>
+      <div class="mode-row">Durum: <b id="shr-state">-</b></div>
+      <div class="chips" id="shr-status"></div>
+      <ul id="shr-alarms" class="alarms"></ul>
+      <div class="pv">
+        <div><label>Fırın sıcaklığı</label><div class="bar heat"><i id="shr-temp-bar"></i></div><b id="shr-temp">-</b><span></span></div>
+        <div><label>Fırındaki paket</label><span></span><b id="shr-inside">-</b><span></span></div>
+        <div><label>Film bobini</label><div class="bar"><i id="shr-film-bar"></i></div><b id="shr-film">-</b><button data-refill="film">Değiştir</button></div>
+        <div><label>Karton altlık</label><span></span><b id="shr-pads">-</b><button data-refill="pads">Doldur</button></div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Paletleme: robot, palet hattı, streç</h2>
+      <div class="mode-row">Durum: <b id="pal-state">-</b></div>
+      <div class="chips" id="pal-status"></div>
+      <ul id="pal-alarms" class="alarms"></ul>
+      <div class="pv">
+        <div><label>Robot işi</label><span></span><b id="pal-job">-</b><span></span></div>
+        <div><label>Son sonuç</label><span></span><b id="pal-res">-</b><span></span></div>
+        <div><label>Paletteki paket</label><div class="bar"><i id="pal-count-bar"></i></div><b id="pal-count">-</b><span></span></div>
+        <div><label>Boş palet</label><span></span><b id="pal-mag">-</b><button data-refill="pallets">Doldur</button></div>
+        <div><label>Karton levha</label><span></span><b id="pal-sheets">-</b><button data-refill="sheets">Doldur</button></div>
+        <div><label>Streç film</label><div class="bar"><i id="pal-stretch-bar"></i></div><b id="pal-stretch">-</b><button data-refill="stretch">Değiştir</button></div>
+        <div><label>Hücre güvenliği</label><span></span><b id="pal-safe">-</b><span></span></div>
+      </div>
+      <div class="cip-ops">
+        <button id="pal-door">Kapıyı aç</button>
+        <button id="pal-intrude">Işık perdesinden geç</button>
+        <button id="pal-remove">B paletini el ile al (hücre kapalıyken)</button>
+        <label class="inline"><input type="checkbox" id="pal-testfeed"> Test besleyici (5 s'de bir hazır paket)</label>
+      </div>
+      <div class="cip-report">Kapı, ışık perdesi ve acil stop simülatördeki ayrı güvenlik kontrolcüsündedir; PLC yalnızca durumunu okur. Güvenlik resetı RESET butonuyla yapılır, hareket için ayrıca START gerekir. Eğitim modelidir, sertifikalı güvenlik tasarımı değildir.</div>
+    </section>
+
+    <section>
+      <h2>AGV ve otomatik depo</h2>
+      <div class="mode-row">AGV: <b id="agv-state">-</b></div>
+      <div class="chips" id="agv-status"></div>
+      <ul id="agv-alarms" class="alarms"></ul>
+      <div class="pv">
+        <div><label>AGV işi</label><span></span><b id="agv-job">-</b><span></span></div>
+        <div><label>Son sonuç</label><span></span><b id="agv-res">-</b><span></span></div>
+        <div><label>Konum</label><span></span><b id="agv-node">-</b><span></span></div>
+        <div><label>Batarya</label><div class="bar"><i id="agv-bat-bar"></i></div><b id="agv-bat">-</b><button id="agv-charge">Elle şarj</button></div>
+      </div>
+      <div class="mode-row">Depo: <b id="asrs-state">-</b></div>
+      <div class="chips" id="asrs-status"></div>
+      <ul id="asrs-alarms" class="alarms"></ul>
+      <div class="pv">
+        <div><label>Vinç işi</label><span></span><b id="asrs-job">-</b><span></span></div>
+        <div><label>Son sonuç</label><span></span><b id="asrs-res">-</b><span></span></div>
+        <div><label>Stok (PLC)</label><div class="bar"><i id="asrs-stock-bar"></i></div><b id="asrs-stock">-</b><span></span></div>
+        <div><label>Depo sıcaklığı</label><span></span><b id="asrs-temp">-</b><span></span></div>
+        <div><label>Sevkiyat</label><span></span><b id="asrs-ship">-</b><span></span></div>
+      </div>
+      <div class="cip-ops">
+        <button data-ship="1">Sevkiyat: 1 palet</button>
+        <button data-ship="3">Sevkiyat: 3 palet</button>
+        <button id="asrs-reject">Reddedilen paleti al</button>
+        <button id="asrs-door">Koridor kapısını aç</button>
+      </div>
+      <div id="rack" class="rack-wrap"></div>
+      <div class="cip-report">Raf haritası: kutudaki sayı raftaki gerçek palet (simülatör). Yeşil: PLC tablosu da dolu diyor; turuncu: PLC tablosu ile raf farklı ya da göz henüz kontrol edilmedi. Sevkiyat FIFO (en eski palet önce).</div>
+    </section>
+
+    <section>
+      <h2>Üretim <small>(simülatörün gerçek kalite ölçümü)</small></h2>
+      <div class="kpi">
+        <div class="good"><b id="k-good">0</b><span>sağlam sevk</span></div>
+        <div class="bad"><b id="k-escape">0</b><span>hatalı sevk</span></div>
+        <div><b id="k-rejbad">0</b><span>doğru red</span></div>
+        <div class="warn"><b id="k-rejgood">0</b><span>gereksiz red</span></div>
+        <div><b id="k-lost">0</b><span>kayıp bardak</span></div>
+        <div><b id="k-spill">0</b><span>dökülen ayran</span></div>
+        <div><b id="k-drain">0</b><span>gidere ürün</span></div>
+        <div class="bad"><b id="k-caustic">0</b><span>ürüne kostik</span></div>
+        <div class="bad"><b id="k-hyg">0</b><span>kirli hattan ürün</span></div>
+        <div class="good"><b id="k-packs">0</b><span>sağlam paket</span></div>
+        <div class="bad"><b id="k-packbad">0</b><span>hatalı paket</span></div>
+        <div class="bad"><b id="k-packreject">0</b><span>karantina paket</span></div>
+        <div><b id="k-lastpack">-</b><span>son paket</span></div>
+        <div class="good"><b id="k-pallets">0</b><span>sevke hazır palet</span></div>
+        <div class="bad"><b id="k-palbad">0</b><span>hatalı palet</span></div>
+        <div class="warn"><b id="k-dropped">0</b><span>robotun düşürdüğü</span></div>
+        <div><b id="k-cycle">-</b><span>al-bırak çevrimi</span></div>
+        <div class="good"><b id="k-stored">0</b><span>depolanan palet</span></div>
+        <div class="good"><b id="k-shipped">0</b><span>kamyona yüklenen</span></div>
+        <div class="warn"><b id="k-rejected">0</b><span>depo girişinde ret</span></div>
+        <div><b id="k-agv">0</b><span>AGV taşıması</span></div>
+      </div>
+      <div class="plc-counters">PLC sayaçları: sağlam <b id="c-good">0</b> · red <b id="c-rej">0</b>
+        <button id="reset-kpi">Sıfırla</button></div>
+    </section>
+
+    <section>
+      <h2>Arıza ekle</h2>
+      <div id="faults" class="faults"></div>
+    </section>
+
+    <section>
+      <h2>I/O <small>(Modbus görüntüsü)</small></h2>
+      <div class="io">
+        <div><h3>Dolum girişleri · IR16</h3><ul id="di"></ul></div>
+        <div><h3>Dolum çıkışları · HR16</h3><ul id="do"></ul></div>
+        <div><h3>Tank girişleri · IR32</h3><ul id="tdi"></ul></div>
+        <div><h3>Tank çıkışları · HR32</h3><ul id="tdo"></ul></div>
+        <div><h3>Paketleme girişleri · IR48</h3><ul id="sdi"></ul></div>
+        <div><h3>Paketleme çıkışları · HR48</h3><ul id="sdo"></ul></div>
+        <div><h3>Paletleme girişleri · IR64</h3><ul id="pdi"></ul></div>
+        <div><h3>Paletleme çıkışları · HR64</h3><ul id="pdo"></ul></div>
+        <div><h3>Robot durumu · IR65</h3><ul id="prob"></ul></div>
+        <div><h3>AGV durumu · IR80</h3><ul id="gdi"></ul></div>
+        <div><h3>AGV çıkışları · HR80</h3><ul id="gdo"></ul></div>
+        <div><h3>Depo girişleri · IR96</h3><ul id="adi"></ul></div>
+        <div><h3>Depo çıkışları · HR96</h3><ul id="ado"></ul></div>
+      </div>
+      <table class="regs"><tbody id="regs"></tbody></table>
+    </section>
+
+    <section>
+      <h2>Olay günlüğü</h2>
+      <ul id="events" class="events"></ul>
+    </section>
+  </aside>
+
+  <script type="module" src="main.js"></script>
+</body>
+</html>

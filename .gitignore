@@ -1,0 +1,9 @@
+node_modules/
+monitor/data/
+codesys/build/
+codesys/*.project
+codesys/*.opt
+codesys/*.precompilecache
+codesys/*.bootinfo
+codesys/*.bootinfo_guids
+codesys/*.compileinfo
