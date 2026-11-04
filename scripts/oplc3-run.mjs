@@ -8,6 +8,7 @@
 // proseste CIP yeniden); sonra 1 paletlik sevkiyat. Sonuç: monitor/data/oplc3-result.json
 import fs from 'node:fs';
 import { execSync } from 'node:child_process';
+import { fileURLToPath } from 'node:url';
 const R = new URL('../', import.meta.url).href;
 const SECS = Number(process.argv[2] || 660);
 const WSL = process.env.WSL_IP || execSync('wsl -d Ubuntu-24.04 -- hostname -I').toString().trim().split(/\s+/)[0];
@@ -19,7 +20,7 @@ const dataDir = new URL('../monitor/data/', import.meta.url);
 // plc/openplc klasörünün WSL yolu (C:\x\y -> /mnt/c/x/y)
 const OPLC_DIR = new URL('../plc/openplc', import.meta.url).pathname.replace(/^\/([A-Za-z]):/, (_, d) => '/mnt/' + d.toLowerCase()).split('/').map(decodeURIComponent).join('/');
 fs.mkdirSync(dataDir, { recursive: true });
-const dbFile = new URL('oplc3.db', dataDir).pathname.replace(/^\/([A-Za-z]:)/, '$1');
+const dbFile = fileURLToPath(new URL('oplc3.db', dataDir));
 for (const f of [dbFile, dbFile + '-wal', dbFile + '-shm']) try { fs.unlinkSync(f); } catch { /* */ }
 const { mon } = await startMonitor({ MON_MODE: 'bolunmus', MON_PORT: 8094, SIM_URL: 'http://127.0.0.1:8090', MON_DB: dbFile,
   MON_PLCS: `proses=${WSL}:5501,paketleme=${WSL}:5502,lojistik=${WSL}:5503`, quiet: true });
