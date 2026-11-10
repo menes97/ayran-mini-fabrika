@@ -1,14 +1,14 @@
 (* =====================================================================
-   Paketleme PLC'si: gruplama, sarma, firin (blok 3) ve robotlu paletleme (blok 4).
+   Packaging PLC: grouping, wrapping, shrink tunnel (block 3) and robotic palletizing (block 4).
    ===================================================================== *)
 VAR
   SHRINK      : FB_Shrink;
   PALLET      : FB_Pallet;
 END_VAR
 (*@BODY@*)
-  (* =================== Gruplama, sarma, firin =================== *)
-  (* sozlesme: cikis bandi dolunca dolum zaten bekler, bu istasyon da kendi cikisi dolunca
-     firina paket birakmaz *)
+  (* =================== Grouping, wrapping, shrink tunnel =================== *)
+  (* contract: when the outfeed belt is full the filler already waits, and this station in turn
+     releases no pack into the tunnel when its own outfeed is full *)
   SHRINK(START := PB_START, STOP_OK := PB_STOP_OK, ESTOP_OK := PB_ESTOP_OK, RESET := PB_RESET,
          RESTART := RESTART, IO_READY := IO_READY, COMM_FAULT := COMM_FAULT,
          IW_DI := SHR_IW_DI, IW_LANE := SHR_IW_LANE, IW_TEMP := SHR_IW_TEMP,
@@ -24,10 +24,11 @@ END_VAR
   SHR_QW_REJECT := SHRINK.QW_REJECT;
   SHR_QW_GOOD := SHRINK.QW_GOOD;
 
-  (* =================== Robotlu paletleme =================== *)
-  (* sozlesme: robot alma noktasindaki paketi almazsa firin cikisi dolar ve shrink firina yeni
-     paket birakmaz. AGV'nin "catallar alim noktasinin disinda" sinyali aracin istasyona verdigi
-     optik sinyaldir: istasyonun kendi girisi (PAL_IW_IL bit 0), lojistik PLC'sinden gecmez. *)
+  (* =================== Robotic palletizing =================== *)
+  (* contract: if the robot does not take the pack at the pickup point, the tunnel outfeed fills up and
+     the shrink tunnel accepts no new pack. The AGV's "forks outside the pickup point" signal is the
+     optical signal the vehicle gives to the station: the station's own input (PAL_IW_IL bit 0); it
+     does not pass through the logistics PLC. *)
   PALLET(START := PB_START, STOP_OK := PB_STOP_OK, ESTOP_OK := PB_ESTOP_OK, RESET := PB_RESET,
          RESTART := RESTART, IO_READY := IO_READY, COMM_FAULT := COMM_FAULT,
          IW_DI := PAL_IW_DI, IW_ROB_DI := PAL_IW_ROB_DI, IW_ACK_SEQ := PAL_IW_ACK_SEQ, IW_RES_SEQ := PAL_IW_RES_SEQ,

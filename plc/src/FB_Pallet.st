@@ -1,26 +1,26 @@
 (* =====================================================================
-   FB_Pallet - robotlu paletleme, palet hatti ve strec sarma (4. blok)
+   FB_Pallet - robotic palletizing, pallet line and stretch wrapping (block 4)
 
-   Robot arayuzu (robot kontrolcusu kendi programini calistirir):
-     PLC -> robot : JOB, SLOT, SEQ. SEQ degisince is baslar; ayni SEQ ikinci
-                    kez calismaz. Is numarasi blok halinde (tek FC16) yazilir.
-     robot -> PLC : ACK_SEQ (is kabul edildi), RES_SEQ + RES_CODE + RES_SLOT
-                    (is bitti). Sonuc kaydi kalicidir.
-   Paletteki paket sayisi yalnizca robot "tamam" (1) ya da "birakildi,
-   sonra iptal" (17) dedikten sonra artar. Dusen paketin slotu bos kalir,
-   bir sonraki paket ayni slota konur. Zaman asiminda is kor olarak
-   tekrarlanmaz: alarm verilir.
+   Robot interface (the robot controller runs its own program):
+     PLC -> robot : JOB, SLOT, SEQ. The job starts when SEQ changes; the same SEQ does not
+                    run a second time. The job number is written as a block (single FC16).
+     robot -> PLC : ACK_SEQ (job accepted), RES_SEQ + RES_CODE + RES_SLOT
+                    (job finished). The result record is retained.
+   The pack count on the pallet increases only after the robot says "done" (1) or "released,
+   then cancelled" (17). The slot of a dropped pack stays empty,
+   and the next pack is placed in the same slot. On a timeout the job is not blindly
+   repeated: an alarm is raised.
 
-   Is secimi (her is bitince yeniden): konum dogrulanmamissa eve don; tutucuda
-   paket varsa bir sonraki slota birak; palet yeni geldiyse alt karton;
-   palet doluysa ust karton; aksi halde alma noktasindaki paketi al. Palet
-   degisirken onceden paket alinmaz: tutucu kartonu da tasidigi icin elinde
-   paketle alt kartonu koyamaz (kilitlenme).
+   Job selection (again after every job): if the position is not verified, go home; if the gripper
+   holds a pack, place it in the next slot; if the pallet has just arrived, the bottom sheet;
+   if the pallet is full, the top sheet; otherwise pick the pack at the pickup point. While the pallet
+   is changing, no pack is picked in advance: because the gripper also carries the sheet, it cannot
+   place the bottom sheet with a pack in hand (deadlock).
 
-   Guvenlik (kapi, isik perdesi, muting, acil stop) simulatordeki bagimsiz
-   guvenlik kontrolcusundedir; bu blok yalnizca durumunu okur. Reset hareket
-   baslatmaz: alarmdan sonra robot HOLD'da kalir, Start ile devam eder.
-   Sertifikali bir guvenlik tasarimi degildir.
+   Safety (door, light curtain, muting, e-stop) is in the independent safety controller
+   in the simulator; this block only reads its status. Reset does not start a movement:
+   after an alarm the robot stays in HOLD and continues with Start.
+   This is not a certified safety design.
    ===================================================================== *)
 
 FUNCTION_BLOCK FB_Pallet
@@ -53,7 +53,7 @@ FUNCTION_BLOCK FB_Pallet
     IW_TURNS    : INT;
     IW_PALLETS  : INT;
     IW_SHEETS   : INT;
-    AGV_CLEAR   : BOOL;   (* AGV catallari alim noktasinin disinda *)
+    AGV_CLEAR   : BOOL;   (* AGV forks are outside the pickup point *)
   END_VAR
   VAR_OUTPUT
     QW_DO        : WORD;
@@ -67,13 +67,13 @@ FUNCTION_BLOCK FB_Pallet
     QW_DONE      : INT;
     QW_PALLET_ID : INT;
     QW_WRAPPED   : INT;
-    PICKUP_RDY   : BOOL;  (* AGV'ye: palet D'de, D konveyoru duruyor *)
+    PICKUP_RDY   : BOOL;  (* to the AGV: pallet at D, D conveyor stopped *)
     RUNNING      : BOOL;
   END_VAR
 
   VAR
-    SLOTS      : INT := 18;     (* 3 kat x 6 paket *)
-    MIN_TURNS  : INT := 9;      (* strec recetesi: 3 alt + 2 cikis + 2 ust + 2 inis *)
+    SLOTS      : INT := 18;     (* 3 layers x 6 packs *)
+    MIN_TURNS  : INT := 9;      (* stretch recipe: 3 bottom + 2 climb + 2 top + 2 descent *)
     ALARM_MASK : WORD := WORD#16#63FF;
   END_VAR
 
@@ -89,11 +89,11 @@ FUNCTION_BLOCK FB_Pallet
     RECOVER_SEQ : INT;
     LAST_SEQ : INT;
     NEXT_SEQ : INT;
-    MODE      : INT := 0;    (* 0 dur, 1 calis, 3 alarm, 4 acil stop *)
-    A_STP     : INT := 0;    (* bos palet besleme *)
-    B_STP     : INT := 0;    (* istif konumu *)
-    C_STP     : INT := 0;    (* strec ve cikis *)
-    R_STP     : INT := 0;    (* robot isi *)
+    MODE      : INT := 0;    (* 0 stopped, 1 running, 3 alarm, 4 e-stop *)
+    A_STP     : INT := 0;    (* empty pallet feed *)
+    B_STP     : INT := 0;    (* stacking position *)
+    C_STP     : INT := 0;    (* stretch and exit *)
+    R_STP     : INT := 0;    (* robot job *)
     JOB       : INT := 0;
     SLOT      : INT := 0;
     SEQ       : INT := 0;
@@ -146,7 +146,7 @@ FUNCTION_BLOCK FB_Pallet
     T_WRAP(IN := FALSE, PT := T#1s);
   END_IF;
 
-  (* =================== 1. Girisleri coz =================== *)
+  (* =================== 1. Decode inputs =================== *)
   DI_PICK       := (IW_DI AND WORD#16#0001) <> WORD#0;
   DI_PAL_A      := (IW_DI AND WORD#16#0002) <> WORD#0;
   DI_PAL_B      := (IW_DI AND WORD#16#0004) <> WORD#0;
@@ -270,18 +270,18 @@ FUNCTION_BLOCK FB_Pallet
     RECOVERING := FALSE; BOOK_OK := FALSE;
   END_IF;
 
-  (* ilk gecerli veride robotun numaralandirmasindan devam et (PLC yeniden basladiysa ayni SEQ'i tekrar gonderme) *)
+  (* continue from the robot's numbering on the first valid data (if the PLC restarted, do not send the same SEQ again) *)
   IF IO_READY AND NOT SEQ_SYNC THEN
     SEQ := IW_ACK_SEQ;
     SEQ_SYNC := TRUE;
   END_IF;
 
-  (* reset penceresi: guvenlik kontrolcusu ve robot resetin etkisini 0,5 s gecikmeyle bildirir *)
+  (* reset window: the safety controller and the robot report the effect of the reset with a 0.5 s delay *)
   IF RT_RESET.Q THEN RST_WIN := TRUE; END_IF;
   T_RSTWIN(IN := RST_WIN, PT := T#3s);
   IF T_RSTWIN.Q THEN RST_WIN := FALSE; END_IF;
 
-  (* =================== 2. Alarmlar =================== *)
+  (* =================== 2. Alarms =================== *)
   IF NOT ESTOP_OK THEN ALARMS := ALARMS OR WORD#16#0001; END_IF;
   IF ESTOP_OK AND NOT DI_SAFETY_OK THEN ALARMS := ALARMS OR WORD#16#0002; END_IF;
   IF R_ERROR THEN ALARMS := ALARMS OR WORD#16#0004; END_IF;
@@ -303,7 +303,7 @@ FUNCTION_BLOCK FB_Pallet
 
   IF (ALARMS AND ALARM_MASK) <> WORD#0 THEN
     IF (ALARMS AND WORD#16#0001) <> WORD#0 THEN MODE := 4; ELSIF MODE <> 4 THEN MODE := 3; END_IF;
-    HOLD_LATCH := TRUE;   (* robot Start'a kadar duraklatilmis kalir *)
+    HOLD_LATCH := TRUE;   (* the robot stays paused until Start *)
   END_IF;
 
   IF RST_WIN AND ESTOP_OK AND DI_SAFETY_OK AND NOT COMM_FAULT AND NOT DI_WRAP_FAULT AND NOT R_ERROR THEN
@@ -311,7 +311,7 @@ FUNCTION_BLOCK FB_Pallet
     RST_WIN := FALSE;
     IF MODE = 3 OR MODE = 4 THEN
       MODE := 0;
-      (* kabul edilmemis isi geri al: robot ayni numarayi gorurse bir sey yapmaz *)
+      (* take back the job that was not accepted: if the robot sees the same number it does nothing *)
       IF R_STP = 10 OR R_STP = 11 THEN
         SEQ := IW_ACK_SEQ;
         R_STP := 0;
@@ -324,7 +324,7 @@ FUNCTION_BLOCK FB_Pallet
     HOLD_LATCH := NOT ROB_BOOT_OK;
   END_IF;
   IF MODE = 1 THEN WAIT_START := FALSE; END_IF;
-  IF MODE = 1 AND NOT STOP_OK THEN MODE := 0; END_IF;   (* cevrim sonu: robot elindeki isi bitirir *)
+  IF MODE = 1 AND NOT STOP_OK THEN MODE := 0; END_IF;   (* end of cycle: the robot finishes the job in hand *)
 
   (* READY means idle; accepted work is resumed without an impossible READY/home
      prerequisite. Idle loaded/off-home robots use the existing place/home branches. *)
@@ -335,8 +335,8 @@ FUNCTION_BLOCK FB_Pallet
   IF NOT ROB_BOOT_OK THEN HOLD_LATCH := TRUE; END_IF;
   IF MODE = 1 AND ROB_BOOT_OK AND (ALARMS AND ALARM_MASK) = WORD#0 THEN HOLD_LATCH := FALSE; END_IF;
 
-  (* =================== 3. Robot isi =================== *)
-  (* sonuc degerlendirmesi her modda calisir; yeni is yalnizca calisirken verilir *)
+  (* =================== 3. Robot job =================== *)
+  (* result evaluation runs in every mode; a new job is issued only while running *)
   CASE R_STP OF
     0:
       IF MODE = 1 AND BOOK_OK AND NOT RECOVERING AND R_READY AND SEQ_SYNC AND NOT HOLD_LATCH THEN
@@ -355,13 +355,13 @@ FUNCTION_BLOCK FB_Pallet
         END_IF;
         IF R_STP = 10 THEN ROB_BOOT_DONE := TRUE; END_IF;
       END_IF;
-    10: (* yeni is numarasi; JOB, SLOT ve SEQ ayni yazmada gider *)
+    10: (* new job number; JOB, SLOT and SEQ go out in the same write *)
       SEQ := SEQ + 1;
       IF SEQ > 30000 THEN SEQ := 1; END_IF;
       R_STP := 11;
-    11: (* kabul bekle *)
+    11: (* wait for acceptance *)
       IF IW_RES_SEQ = SEQ OR IW_ACK_SEQ = SEQ THEN R_STP := 12; END_IF;
-    12: (* sonuc bekle *)
+    12: (* wait for result *)
       IF IW_RES_SEQ = SEQ THEN
         R_STP := 0;
         LAST_SEQ := IW_RES_SEQ;
@@ -384,13 +384,13 @@ FUNCTION_BLOCK FB_Pallet
         ELSIF IW_RES_CODE = 12 OR IW_RES_CODE = 16 THEN
           ALARMS := ALARMS OR WORD#16#0200;
         END_IF;
-        (* 13 = iptal: sayac degismez, is yeniden secilir *)
+        (* 13 = cancelled: the counter does not change, the job is selected again *)
       END_IF;
   END_CASE;
 
-  (* =================== 4. Palet hatti =================== *)
+  (* =================== 4. Pallet line =================== *)
   IF MODE = 1 AND NOT RECOVERING THEN
-    (* A: bos palet besleme; istif konumu dolarken bile bir sonraki palet hazirlanir *)
+    (* A: empty pallet feed; the next pallet is prepared even while the stacking position is filling *)
     CASE A_STP OF
       0:
         IF NOT DI_PAL_A AND NOT DI_DISP_BUSY AND IW_PALLETS > 0 AND B_STP <> 2 THEN A_STP := 1; END_IF;
@@ -398,7 +398,7 @@ FUNCTION_BLOCK FB_Pallet
         IF DI_PAL_A THEN A_STP := 0; END_IF;
     END_CASE;
 
-    (* B: istif konumu *)
+    (* B: stacking position *)
     CASE B_STP OF
       0:
         IF DI_PAL_B THEN
@@ -406,20 +406,20 @@ FUNCTION_BLOCK FB_Pallet
         ELSIF DI_PAL_A AND A_STP = 0 THEN
           B_STP := 2;
         END_IF;
-      2: (* A -> B, pim yukarida *)
+      2: (* A -> B, pin up *)
         IF DI_PAL_B THEN B_STP := 3; END_IF;
-      3: (* yeni palet: defter sifirlanir *)
+      3: (* new pallet: the ledger is reset *)
         PALLET_ID := PALLET_ID + 1;
         IF PALLET_ID > 30000 THEN PALLET_ID := 1; END_IF;
         COUNT := 0;
         SHEET_BOT := FALSE;
         SHEET_TOP := FALSE;
         B_STP := 10;
-      10: (* istif *)
+      10: (* stacking *)
         IF COUNT >= SLOTS AND SHEET_TOP THEN B_STP := 20; END_IF;
-      20: (* palet dolu: robot bolge disinda, strec bos ve tabla baslangicta olunca birak *)
+      20: (* pallet full: release when the robot is outside the zone, the stretch wrapper is empty and the turntable is at its start position *)
         IF R_CLEAR AND R_STP = 0 AND C_STP = 0 AND NOT DI_PAL_C AND DI_WRAP_HOME THEN B_STP := 21; END_IF;
-      21: (* pim asagi, B -> C *)
+      21: (* pin down, B -> C *)
         IF DI_PAL_C AND NOT DI_PAL_B THEN
           DONE_CNT := DONE_CNT + 1;
           IF DONE_CNT > 30000 THEN DONE_CNT := 0; END_IF;
@@ -428,11 +428,11 @@ FUNCTION_BLOCK FB_Pallet
         END_IF;
     END_CASE;
 
-    (* C: strec sarma ve alim noktasina cikis *)
+    (* C: stretch wrapping and exit to the pickup point *)
     CASE C_STP OF
       0:
         IF DI_PAL_C AND B_STP <> 21 THEN C_STP := 1; END_IF;
-      1: (* istek "bitti" gelene kadar tutulur *)
+      1: (* the request is held until "done" arrives *)
         IF DI_WRAP_DONE THEN
           UNDERWRAP := IW_TURNS < MIN_TURNS;
           WRAPPED := WRAPPED + 1;
@@ -441,14 +441,14 @@ FUNCTION_BLOCK FB_Pallet
         END_IF;
       2:
         IF NOT DI_WRAP_DONE AND DI_WRAP_HOME THEN C_STP := 3; END_IF;
-      3: (* alim noktasi bos ve AGV catallari disarida olunca *)
+      3: (* when the pickup point is empty and the AGV forks are outside *)
         IF NOT DI_PAL_D AND AGV_CLEAR THEN C_STP := 4; END_IF;
-      4: (* C -> D; isik perdesi muting'i palet gecerken guvenlik kontrolcusunde *)
+      4: (* C -> D; the light curtain muting while the pallet passes is in the safety controller *)
         IF DI_PAL_D AND NOT DI_PAL_C THEN C_STP := 0; END_IF;
     END_CASE;
   END_IF;
 
-  (* =================== 5. Cikislar =================== *)
+  (* =================== 5. Outputs =================== *)
   IF BOOK_OK THEN
     RET_MAGIC := WORD#0; (* invalidate before payload, commit last *)
     RET_MAPVER := 7;

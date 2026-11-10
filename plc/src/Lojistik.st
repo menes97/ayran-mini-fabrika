@@ -1,13 +1,13 @@
 (* =====================================================================
-   Lojistik PLC'si: AGV ana kontrolu (blok 5) ve otomatik soguk depo (blok 6).
+   Logistics PLC: AGV main control (block 5) and automated cold store (block 6).
    ===================================================================== *)
 VAR
   AGV         : FB_Agv;
   ASRS        : FB_Asrs;
 END_VAR
 (*@BODY@*)
-  (* =================== Otomatik depo =================== *)
-  (* giris konveyoru AGV catallari disaridayken calisir *)
+  (* =================== Automated cold store =================== *)
+  (* the inbound conveyor runs only while the AGV forks are outside *)
   ASRS(START := PB_START, STOP_OK := PB_STOP_OK, ESTOP_OK := PB_ESTOP_OK, RESET := PB_RESET,
        RESTART := RESTART, IO_READY := IO_READY, COMM_FAULT := COMM_FAULT,
        IW_DI := ASRS_IW_DI, IW_ACK_SEQ := ASRS_IW_ACK_SEQ, IW_RES_SEQ := ASRS_IW_RES_SEQ,
@@ -31,9 +31,9 @@ END_VAR
   ASRS_QW_NEXT_ID := ASRS.QW_NEXT_ID;
 
   (* =================== AGV =================== *)
-  (* paletleme hucresi ve depo izinlerine gore tasir. "Alim noktasinda palet hazir":
-     tek PLC'de dogrudan PALLET.PICKUP_RDY, bolunmus modda paketleme PLC'sinin PAL_QW_DO bit 11
-     cikisindan gelen kablo (AGV_IW_IL bit 0). *)
+  (* moves pallets according to the palletizing cell and cold store permissions. "Pallet ready at the
+     pickup point": in a single PLC, PALLET.PICKUP_RDY directly; in split mode, the wire from the
+     packaging PLC's PAL_QW_DO bit 11 output (AGV_IW_IL bit 0). *)
   AGV(START := PB_START, STOP_OK := PB_STOP_OK, ESTOP_OK := PB_ESTOP_OK, RESET := PB_RESET,
       RESTART := RESTART, IO_READY := IO_READY, COMM_FAULT := COMM_FAULT,
       IW_DI := AGV_IW_DI, IW_ACK_SEQ := AGV_IW_ACK_SEQ, IW_RES_SEQ := AGV_IW_RES_SEQ,

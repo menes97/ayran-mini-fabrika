@@ -1,13 +1,13 @@
 (* =====================================================================
-   Proses PLC'si: dolum-kapama (blok 1) ve tank, transfer, CIP (blok 2).
-   Blok 0'in (fabrika ozeti) sahibi de bu PLC'dir.
+   Process PLC: fill-and-seal (block 1) and tank, transfer, CIP (block 2).
+   This PLC also owns block 0 (factory summary).
    ===================================================================== *)
 VAR
   DOLUM       : FB_Dolum;
   TANK        : FB_Tank;
 END_VAR
 (*@BODY@*)
-  (* =================== Dolum-kapama =================== *)
+  (* =================== Fill-and-seal =================== *)
   DOLUM(START := PB_START, STOP_OK := PB_STOP_OK, ESTOP_OK := PB_ESTOP_OK, RESET := PB_RESET,
         RESTART := RESTART, IO_READY := IO_READY, COMM_FAULT := COMM_FAULT,
         IW_DI := DOL_IW_DI, IW_FILL := DOL_IW_FILL, IW_TANK := DOL_IW_TANK,
@@ -19,7 +19,7 @@ END_VAR
   DOL_QW_REJECT := DOLUM.QW_REJECT;
   DOL_QW_STATUS := DOLUM.QW_STATUS;
 
-  (* el sikisma: dolum makinesi urun ister, tank istasyonu aktarir (ayni PLC) *)
+  (* handshake: the filling machine requests product, the tank station transfers it (same PLC) *)
   TANK(START := PB_START, TNK_COMMISSION := TNK_COMMISSION, ESTOP_OK := PB_ESTOP_OK, RESET := PB_RESET, RESTART := RESTART, IO_READY := IO_READY, COMM_FAULT := COMM_FAULT,
        REQ := DOLUM.PRODUCT_REQ,
        IW_DI := TNK_IW_DI, IW_T1_LVL := TNK_IW_T1_LVL, IW_FLOW := TNK_IW_FLOW, IW_TOTAL := TNK_IW_TOTAL,
@@ -37,7 +37,7 @@ END_VAR
   TNK_QW_CIP_DUR  := TANK.QW_CIP_DUR;
   TNK_QW_STATUS := TANK.QW_STATUS;
 (*@END@*)
-  (* =================== Fabrika ozeti (blok 0) =================== *)
+  (* =================== Factory summary (block 0) =================== *)
   FAB_QW_PLC_HB := PLC_HB;
   IF DOLUM.RUNNING THEN FAB_QW_DO := WORD#16#0001; ELSE FAB_QW_DO := WORD#0; END_IF;
   FAB_QW_STATE := DOLUM.QW_STATE;

@@ -1,21 +1,21 @@
 (* =====================================================================
-   FB_Asrs - otomatik depo: giris kontrolu, vinc isleri, goz tablosu (6. blok)
+   FB_Asrs - automated cold store: inbound control, stacker crane jobs, slot table (block 6)
 
-   Goz tablosu (mini WMS): her goz icin durum ve palet numarasi.
-     LST: 0 BOS, 1 AYRILDI (depolama isi verildi), 2 DOLU, 3 BELIRSIZ
-   Gercek durum simulatorde; bu tablo beklenen envanterdir. Belirsiz goz
-   (yarim kalan is, cift depolama, PLC yeniden basladi) vincin "goz kontrolu"
-   isiyle uzlastirilir: vinc gider, catal okuyucusuyla etiketi okur.
-   PLC baslarken tablo kalici olmadigi icin butun gozler belirsizdir ve
-   envanter sayimi kendiliginden yapilir.
+   Slot table (mini WMS): status and pallet number for each slot.
+     LST: 0 EMPTY, 1 RESERVED (storage job issued), 2 FULL, 3 UNKNOWN
+   The real state is in the simulator; this table is the expected inventory. An unknown slot
+   (unfinished job, double storage, PLC restarted) is reconciled by the crane's "slot check"
+   job: the crane goes there and reads the label with its fork reader.
+   Because the table is not retained when the PLC starts, all slots are unknown and
+   the inventory count happens by itself.
 
-   Yerlesim: en alt kat, P&D'ye en yakin sutun once. Sevkiyat FIFO (en eski
-   palet numarasi); ayni raf omrunde FEFO ile ayni sonucu verir, gercek FEFO
-   icin lot ve son kullanma tarihi gerekir.
+   Placement: lowest level first, the column closest to the P&D station first. Shipping is FIFO (oldest
+   pallet number); with the same shelf life it gives the same result as FEFO, true FEFO
+   needs a lot and an expiry date.
 
-   Giris: kontur ve etiket kontrolu; gecemeyen palet depolanmaz, operator
-   alir. Kimliksiz stok olusmaz. Vinc catali P&D'deyken giris konveyoru
-   calismaz; AGV catallari girisin icindeyken de calismaz.
+   Inbound: contour and label check; a pallet that fails is not stored, the operator
+   takes it. No stock without an ID is created. The inbound conveyor does not run while the crane fork is at P&D;
+   it also does not run while the AGV forks are inside the inlet.
    ===================================================================== *)
 
 FUNCTION_BLOCK FB_Asrs
@@ -32,7 +32,7 @@ FUNCTION_BLOCK FB_Asrs
     IW_RES_ID    : INT;
     IW_IN_ID     : INT;
     IW_FORK_ID   : INT;
-    IW_TEMP      : INT;     (* 0,1 C *)
+    IW_TEMP      : INT;     (* 0.1 C *)
     IW_SHIP_REQ  : INT;
     AGV_CLEAR_IN : BOOL;
   END_VAR
@@ -52,12 +52,12 @@ FUNCTION_BLOCK FB_Asrs
     QW_STORED  : INT;
     QW_PICKED  : INT;
     QW_NEXT_ID : INT;
-    IN_READY   : BOOL;     (* AGV'ye: giris bos, konveyor duruyor *)
+    IN_READY   : BOOL;     (* to the AGV: inlet empty, conveyor stopped *)
     RUNNING    : BOOL;
   END_VAR
 
   VAR
-    TEMP_MAX   : INT := 60;     (* 6,0 C *)
+    TEMP_MAX   : INT := 60;     (* 6.0 C *)
     ALARM_MASK : WORD := WORD#16#23FF;
   END_VAR
 
@@ -69,9 +69,9 @@ FUNCTION_BLOCK FB_Asrs
     INIT_DONE  : BOOL;
     WAIT_START : BOOL := TRUE;
     MODE       : INT := 0;
-    R_STP      : INT := 0;    (* vinc isi *)
-    I_STP      : INT := 0;    (* giris *)
-    O_STP      : INT := 0;    (* cikis *)
+    R_STP      : INT := 0;    (* crane job *)
+    I_STP      : INT := 0;    (* inbound *)
+    O_STP      : INT := 0;    (* outbound *)
     JOB        : INT := 0;
     LOC        : INT := 0;
     SEQ        : INT := 0;
@@ -129,7 +129,7 @@ FUNCTION_BLOCK FB_Asrs
     T_TEMP(IN := FALSE, PT := T#1s);
   END_IF;
 
-  (* =================== 1. Girisleri coz =================== *)
+  (* =================== 1. Decode inputs =================== *)
   D_CR_READY    := (IW_DI AND WORD#16#0001) <> WORD#0;
   D_HOMED       := (IW_DI AND WORD#16#0004) <> WORD#0;
   D_FORK_CENTER := (IW_DI AND WORD#16#0008) <> WORD#0;
@@ -147,7 +147,7 @@ FUNCTION_BLOCK FB_Asrs
   RT_START(CLK := START);
   RT_RESET(CLK := RESET);
 
-  (* tablo kalici degil: baslangicta butun gozler belirsiz, sayim yapilir *)
+  (* table is not retained: at start all slots are unknown, a count is done *)
   IF NOT INIT_DONE THEN
     FOR I := 1 TO 36 DO
       LST[I] := 3;
@@ -157,15 +157,15 @@ FUNCTION_BLOCK FB_Asrs
   END_IF;
   IF IO_READY AND NOT SEQ_SYNC THEN
     SEQ := IW_ACK_SEQ;
-    SHIP_DONE := IW_SHIP_REQ;   (* PLC kapaliyken verilen siparisler sayilmaz *)
+    SHIP_DONE := IW_SHIP_REQ;   (* orders issued while the PLC was off are not counted *)
     SEQ_SYNC := TRUE;
   END_IF;
   IF RT_RESET.Q THEN RST_WIN := TRUE; END_IF;
   T_RSTWIN(IN := RST_WIN, PT := T#3s);
   IF T_RSTWIN.Q THEN RST_WIN := FALSE; END_IF;
 
-  (* =================== 2. Goz tablosunu tara =================== *)
-  (* skor: kat*100 + P&D'ye uzaklik*10 + taraf; kucuk olan once *)
+  (* =================== 2. Scan the slot table =================== *)
+  (* score: level*100 + distance to P&D*10 + side; the smaller one first *)
   BEST_E := 0; BEST_ESC := 32000; BEST_U := 0; BEST_USC := 32000;
   OLDEST := 0; OLDEST_ID := 32000; STOCK := 0; UNKNOWN := 0;
   FOR I := 1 TO 36 DO
@@ -184,7 +184,7 @@ FUNCTION_BLOCK FB_Asrs
   FULL := BEST_E = 0 AND UNKNOWN = 0;
   SHIP_PEND := IW_SHIP_REQ <> SHIP_DONE;
 
-  (* =================== 3. Alarmlar =================== *)
+  (* =================== 3. Alarms =================== *)
   IF NOT ESTOP_OK THEN ALARMS := ALARMS OR WORD#16#0001; END_IF;
   IF ESTOP_OK AND NOT D_SAFETY_OK THEN ALARMS := ALARMS OR WORD#16#0002; END_IF;
   IF COMM_FAULT THEN ALARMS := ALARMS OR WORD#16#2000; END_IF;
@@ -208,7 +208,7 @@ FUNCTION_BLOCK FB_Asrs
       MODE := 0;
       IF R_STP = 10 OR R_STP = 11 THEN
         IF JOB = 1 AND LOC >= 1 THEN
-          IF LST[LOC] = 1 THEN LST[LOC] := 0; END_IF;   (* kabul edilmemis depolama: ayirmayi geri al *)
+          IF LST[LOC] = 1 THEN LST[LOC] := 0; END_IF;   (* storage not accepted: undo the reservation *)
         END_IF;
         SEQ := IW_ACK_SEQ;
         R_STP := 0;
@@ -222,19 +222,19 @@ FUNCTION_BLOCK FB_Asrs
   IF MODE = 1 THEN WAIT_START := FALSE; END_IF;
   IF MODE = 1 AND NOT STOP_OK THEN MODE := 0; END_IF;
 
-  (* =================== 4. Vinc isi =================== *)
+  (* =================== 4. Crane job =================== *)
   CASE R_STP OF
     0:
       IF MODE = 1 AND D_CR_READY AND SEQ_SYNC AND NOT HOLD_LATCH THEN
         IF NOT D_HOMED THEN
           JOB := 3; LOC := 0; R_STP := 10;
         ELSIF D_FORK_LOAD THEN
-          IF BEST_E > 0 THEN   (* catalda kalmis palet: yeni goze *)
+          IF BEST_E > 0 THEN   (* pallet left on the forks: to a new slot *)
             JOB := 1; LOC := BEST_E; LST[LOC] := 1; PEND_ID := IW_FORK_ID; R_STP := 10;
           ELSIF BEST_U > 0 THEN
             JOB := 4; LOC := BEST_U; R_STP := 10; (* first prove an empty location *)
           END_IF;
-        ELSIF D_IN_PD AND BEST_E > 0 AND I_STP <> 4 THEN   (* palet numarasi once kaydedilsin *)
+        ELSIF D_IN_PD AND BEST_E > 0 AND I_STP <> 4 THEN   (* let the pallet number be recorded first *)
           JOB := 1; LOC := BEST_E; LST[LOC] := 1; PEND_ID := PD_ID; R_STP := 10;
         ELSIF SHIP_PEND AND OLDEST > 0 AND NOT D_OUT_PD AND O_STP = 0 THEN
           JOB := 2; LOC := OLDEST; R_STP := 10;
@@ -258,7 +258,7 @@ FUNCTION_BLOCK FB_Asrs
             STORED := STORED + 1;
             IF STORED > 30000 THEN STORED := 0; END_IF;
           ELSIF IW_RES_CODE = 11 THEN
-            (* goz dolu cikti: tablo yanlis. Vincin okudugu paleti yaz, alarm *)
+            (* slot turned out to be full: the table is wrong. Record the pallet the crane read, alarm *)
             LST[LOC] := 2; LID[LOC] := IW_RES_ID;
             ALARMS := ALARMS OR WORD#16#0010;
           ELSIF IW_RES_CODE = 10 THEN
@@ -268,7 +268,7 @@ FUNCTION_BLOCK FB_Asrs
             LST[LOC] := 0;
             ALARMS := ALARMS OR WORD#16#0200;
           ELSE
-            LST[LOC] := 3;      (* iptal ya da ariza: goz kontrol edilecek *)
+            LST[LOC] := 3;      (* cancel or fault: the slot will be checked *)
           END_IF;
         ELSIF JOB = 2 THEN
           IF IW_RES_CODE = 1 OR IW_RES_CODE = 17 THEN
@@ -297,10 +297,10 @@ FUNCTION_BLOCK FB_Asrs
       END_IF;
   END_CASE;
 
-  (* =================== 5. Giris ve cikis konveyorleri =================== *)
+  (* =================== 5. Inbound and outbound conveyors =================== *)
   IF MODE = 1 THEN
     CASE I_STP OF
-      0: (* AGV birakti ve catallar disarida; yeniden baslangicta kontrol noktasinda palet varsa olcumu degerlendir *)
+      0: (* AGV dropped off and the forks are outside; on a restart, if there is a pallet at the check point, evaluate the measurement *)
         IF D_IN_CHECK THEN
           I_STP := 2;
         ELSIF D_IN_ENTRY AND AGV_CLEAR_IN THEN
@@ -308,7 +308,7 @@ FUNCTION_BLOCK FB_Asrs
         END_IF;
       1:
         IF D_IN_CHECK THEN I_STP := 2; END_IF;
-      2: (* kontur ve etiket *)
+      2: (* contour and label *)
         IF D_CHECK_DONE THEN
           IF D_CONTOUR_OK AND IW_IN_ID > 0 THEN
             CHK_ID := IW_IN_ID;
@@ -318,11 +318,11 @@ FUNCTION_BLOCK FB_Asrs
             I_STP := 5;
           END_IF;
         END_IF;
-      3: (* P&D bos ve vinc catali ortada olunca *)
+      3: (* when P&D is empty and the crane fork is centered *)
         IF NOT D_IN_PD AND D_FORK_CENTER AND R_STP <> 12 THEN I_STP := 4; END_IF;
       4:
         IF D_IN_PD THEN PD_ID := CHK_ID; I_STP := 0; END_IF;
-      5: (* ret: operator paleti alana kadar *)
+      5: (* reject: until the operator takes the pallet *)
         IF NOT D_IN_CHECK THEN I_STP := 0; END_IF;
     END_CASE;
     CASE O_STP OF
@@ -339,7 +339,7 @@ FUNCTION_BLOCK FB_Asrs
   Q_OUT := MODE = 1 AND O_STP = 1;
   IN_READY := NOT WAIT_START AND NOT D_IN_ENTRY AND NOT Q_IN1 AND IO_READY;
 
-  (* =================== 6. Cikislar =================== *)
+  (* =================== 6. Outputs =================== *)
   QW_DO := WORD#0;
   IF ESTOP_OK AND D_SAFETY_OK AND IO_READY AND NOT COMM_FAULT THEN QW_DO := QW_DO OR WORD#16#0001; END_IF;
   IF HOLD_LATCH THEN QW_DO := QW_DO OR WORD#16#0002; END_IF;
@@ -347,7 +347,7 @@ FUNCTION_BLOCK FB_Asrs
   IF Q_IN1 THEN QW_DO := QW_DO OR WORD#16#0008; END_IF;
   IF Q_IN2 THEN QW_DO := QW_DO OR WORD#16#0010; END_IF;
   IF Q_OUT THEN QW_DO := QW_DO OR WORD#16#0020; END_IF;
-  IF IO_READY THEN QW_DO := QW_DO OR WORD#16#0040; END_IF;          (* sogutma *)
+  IF IO_READY THEN QW_DO := QW_DO OR WORD#16#0040; END_IF;          (* cooling *)
   IF I_STP = 5 THEN QW_DO := QW_DO OR WORD#16#0080; END_IF;
 
   T_TEMP(IN := IW_TEMP > TEMP_MAX, PT := T#30s);
@@ -357,7 +357,7 @@ FUNCTION_BLOCK FB_Asrs
   IF UNKNOWN > 0 THEN WARNS := WARNS OR WORD#16#1000; END_IF;
   QW_ALARM := ALARMS OR WARNS;
 
-  (* PLC envanteri: dolu gozler bit olarak (simulatorle karsilastirmak icin) *)
+  (* PLC inventory: full slots as bits (to compare with the simulator) *)
   OCC_A := WORD#0; OCC_B := WORD#0; OCC_C := WORD#0;
   MASK := WORD#1;
   FOR I := 1 TO 36 DO

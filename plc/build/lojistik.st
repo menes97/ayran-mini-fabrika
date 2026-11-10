@@ -8,20 +8,20 @@
 
 
 (* =====================================================================
-   FB_Agv - otonom transpalet icin basit ana kontrol (5. blok)
+   FB_Agv - simple main control for an autonomous pallet truck (block 5)
 
-   Arac kendi navigasyonunu yapar; PLC is verir (robot ve vincle ayni el
-   sikisma): ORDER + SEQ yazilir, arac ACK_SEQ, RES_SEQ, RES_CODE doner.
-   Isler: 1 tasi (D -> depo girisi), 2 cataldaki yuku depoya birak,
-   3 sarj, 4 park. VDA 5050 degildir.
+   The vehicle does its own navigation; the PLC issues jobs (same handshake
+   as with the robot and the crane): ORDER + SEQ are written, the vehicle returns ACK_SEQ, RES_SEQ, RES_CODE.
+   Jobs: 1 transport (D -> cold store inlet), 2 drop the load on the forks into the store,
+   3 charge, 4 park. This is not VDA 5050.
 
-   Istasyon izinleri (E84 benzeri): alim noktasi izni, palet D'de ve D
-   konveyoru duruyorken; depo girisi izni, giris bos ve konveyor duruyorken
-   verilir. Izin transfer boyunca tutulur. Arac "catallar disarida" bilgisini
-   verir; catallar icerideyken o istasyonun konveyoru calismaz (Fabrika'da
-   PALLET ve ASRS bloklarina baglanir).
+   Station permissions (E84-like): the pickup point permission is given while a pallet is at D and the D
+   conveyor is stopped; the cold store inlet permission is given while the inlet is empty and the conveyor
+   is stopped. The permission is held throughout the transfer. The vehicle reports "forks outside";
+   while the forks are inside, that station's conveyor does not run (wired in the Factory program
+   to the PALLET and ASRS blocks).
 
-   Tarayici guvenligi aracin kendisindedir; bu blok yalnizca durumunu okur.
+   Scanner safety is on the vehicle itself; this block only reads its status.
    ===================================================================== *)
 
 FUNCTION_BLOCK FB_Agv
@@ -35,8 +35,8 @@ FUNCTION_BLOCK FB_Agv
     IW_RES_SEQ  : INT;
     IW_RES_CODE : INT;
     IW_BATTERY  : INT;
-    D_READY     : BOOL;   (* paletleme: alim noktasinda palet hazir, konveyor duruyor *)
-    IN_READY    : BOOL;   (* depo: giris bos, konveyor duruyor *)
+    D_READY     : BOOL;   (* palletizing: pallet ready at the pickup point, conveyor stopped *)
+    IN_READY    : BOOL;   (* cold store: inlet empty, conveyor stopped *)
   END_VAR
   VAR_OUTPUT
     QW_DO     : WORD;
@@ -50,8 +50,8 @@ FUNCTION_BLOCK FB_Agv
   END_VAR
 
   VAR
-    BAT_LOW    : INT := 30;    (* bu degerin altinda once sarj *)
-    BAT_FULL   : INT := 80;    (* bosta bunun altindaysa sarja git *)
+    BAT_LOW    : INT := 30;    (* below this value, charge first *)
+    BAT_FULL   : INT := 80;    (* when idle and below this, go charge *)
     ALARM_MASK : WORD := WORD#16#23FF;
   END_VAR
 
@@ -89,7 +89,7 @@ FUNCTION_BLOCK FB_Agv
     T_PERMIT(IN := FALSE, PT := T#1s);
   END_IF;
 
-  (* =================== 1. Girisleri coz =================== *)
+  (* =================== 1. Decode inputs =================== *)
   A_READY     := (IW_DI AND WORD#16#0001) <> WORD#0;
   A_LOADED    := (IW_DI AND WORD#16#0004) <> WORD#0;
   A_CHARGING  := (IW_DI AND WORD#16#0100) <> WORD#0;
@@ -106,12 +106,12 @@ FUNCTION_BLOCK FB_Agv
   T_RSTWIN(IN := RST_WIN, PT := T#3s);
   IF T_RSTWIN.Q THEN RST_WIN := FALSE; END_IF;
 
-  (* =================== 2. Alarmlar =================== *)
+  (* =================== 2. Alarms =================== *)
   IF NOT ESTOP_OK THEN ALARMS := ALARMS OR WORD#16#0001; END_IF;
   IF A_ERROR THEN ALARMS := ALARMS OR WORD#16#0004; END_IF;
   IF COMM_FAULT THEN ALARMS := ALARMS OR WORD#16#2000; END_IF;
   T_ACK(IN := R_STP = 11 AND NOT HOLD_LATCH AND NOT RST_WIN, PT := T#3s);
-  (* izin ya da engel beklerken is suresi sayilmaz *)
+  (* job time is not counted while waiting for a permission or an obstacle *)
   T_RES(IN := R_STP = 12 AND NOT HOLD_LATCH AND NOT A_WAIT AND NOT A_SCAN_STOP AND NOT RST_WIN, PT := T#90s);
   IF T_ACK.Q OR T_RES.Q THEN ALARMS := ALARMS OR WORD#16#0020; END_IF;
   IF NOT IO_READY THEN ALARMS := ALARMS_BEFORE; END_IF;
@@ -135,18 +135,18 @@ FUNCTION_BLOCK FB_Agv
   IF MODE = 1 THEN WAIT_START := FALSE; END_IF;
   IF MODE = 1 AND NOT STOP_OK THEN MODE := 0; END_IF;
 
-  (* =================== 3. Is secimi ve sonuc =================== *)
+  (* =================== 3. Job selection and result =================== *)
   CASE R_STP OF
     0:
       IF MODE = 1 AND A_READY AND SEQ_SYNC AND NOT HOLD_LATCH THEN
         IF A_LOADED THEN
-          ORDER := 2; R_STP := 10;            (* yarim kalan teslimat: yuk aracta *)
+          ORDER := 2; R_STP := 10;            (* unfinished delivery: load is on the vehicle *)
         ELSIF IW_BATTERY < BAT_LOW THEN
           IF NOT A_AT_CHG THEN ORDER := 3; R_STP := 10; END_IF;
         ELSIF D_READY THEN
           ORDER := 1; R_STP := 10;
         ELSIF NOT A_AT_CHG AND IW_BATTERY < BAT_FULL THEN
-          ORDER := 3; R_STP := 10;            (* firsat sarji *)
+          ORDER := 3; R_STP := 10;            (* opportunity charge *)
         ELSIF NOT A_AT_CHG AND NOT A_AT_PARK THEN
           ORDER := 4; R_STP := 10;
         END_IF;
@@ -177,7 +177,7 @@ FUNCTION_BLOCK FB_Agv
       END_IF;
   END_CASE;
 
-  (* =================== 4. Cikislar =================== *)
+  (* =================== 4. Outputs =================== *)
   Q_PERMIT_D  := D_READY AND R_STP = 12 AND ORDER = 1;
   Q_PERMIT_IN := IN_READY AND R_STP = 12 AND (ORDER = 1 OR ORDER = 2);
 
@@ -235,23 +235,23 @@ END_FUNCTION_BLOCK
 
 
 (* =====================================================================
-   FB_Asrs - otomatik depo: giris kontrolu, vinc isleri, goz tablosu (6. blok)
+   FB_Asrs - automated cold store: inbound control, stacker crane jobs, slot table (block 6)
 
-   Goz tablosu (mini WMS): her goz icin durum ve palet numarasi.
-     LST: 0 BOS, 1 AYRILDI (depolama isi verildi), 2 DOLU, 3 BELIRSIZ
-   Gercek durum simulatorde; bu tablo beklenen envanterdir. Belirsiz goz
-   (yarim kalan is, cift depolama, PLC yeniden basladi) vincin "goz kontrolu"
-   isiyle uzlastirilir: vinc gider, catal okuyucusuyla etiketi okur.
-   PLC baslarken tablo kalici olmadigi icin butun gozler belirsizdir ve
-   envanter sayimi kendiliginden yapilir.
+   Slot table (mini WMS): status and pallet number for each slot.
+     LST: 0 EMPTY, 1 RESERVED (storage job issued), 2 FULL, 3 UNKNOWN
+   The real state is in the simulator; this table is the expected inventory. An unknown slot
+   (unfinished job, double storage, PLC restarted) is reconciled by the crane's "slot check"
+   job: the crane goes there and reads the label with its fork reader.
+   Because the table is not retained when the PLC starts, all slots are unknown and
+   the inventory count happens by itself.
 
-   Yerlesim: en alt kat, P&D'ye en yakin sutun once. Sevkiyat FIFO (en eski
-   palet numarasi); ayni raf omrunde FEFO ile ayni sonucu verir, gercek FEFO
-   icin lot ve son kullanma tarihi gerekir.
+   Placement: lowest level first, the column closest to the P&D station first. Shipping is FIFO (oldest
+   pallet number); with the same shelf life it gives the same result as FEFO, true FEFO
+   needs a lot and an expiry date.
 
-   Giris: kontur ve etiket kontrolu; gecemeyen palet depolanmaz, operator
-   alir. Kimliksiz stok olusmaz. Vinc catali P&D'deyken giris konveyoru
-   calismaz; AGV catallari girisin icindeyken de calismaz.
+   Inbound: contour and label check; a pallet that fails is not stored, the operator
+   takes it. No stock without an ID is created. The inbound conveyor does not run while the crane fork is at P&D;
+   it also does not run while the AGV forks are inside the inlet.
    ===================================================================== *)
 
 FUNCTION_BLOCK FB_Asrs
@@ -268,7 +268,7 @@ FUNCTION_BLOCK FB_Asrs
     IW_RES_ID    : INT;
     IW_IN_ID     : INT;
     IW_FORK_ID   : INT;
-    IW_TEMP      : INT;     (* 0,1 C *)
+    IW_TEMP      : INT;     (* 0.1 C *)
     IW_SHIP_REQ  : INT;
     AGV_CLEAR_IN : BOOL;
   END_VAR
@@ -288,12 +288,12 @@ FUNCTION_BLOCK FB_Asrs
     QW_STORED  : INT;
     QW_PICKED  : INT;
     QW_NEXT_ID : INT;
-    IN_READY   : BOOL;     (* AGV'ye: giris bos, konveyor duruyor *)
+    IN_READY   : BOOL;     (* to the AGV: inlet empty, conveyor stopped *)
     RUNNING    : BOOL;
   END_VAR
 
   VAR
-    TEMP_MAX   : INT := 60;     (* 6,0 C *)
+    TEMP_MAX   : INT := 60;     (* 6.0 C *)
     ALARM_MASK : WORD := WORD#16#23FF;
   END_VAR
 
@@ -305,9 +305,9 @@ FUNCTION_BLOCK FB_Asrs
     INIT_DONE  : BOOL;
     WAIT_START : BOOL := TRUE;
     MODE       : INT := 0;
-    R_STP      : INT := 0;    (* vinc isi *)
-    I_STP      : INT := 0;    (* giris *)
-    O_STP      : INT := 0;    (* cikis *)
+    R_STP      : INT := 0;    (* crane job *)
+    I_STP      : INT := 0;    (* inbound *)
+    O_STP      : INT := 0;    (* outbound *)
     JOB        : INT := 0;
     LOC        : INT := 0;
     SEQ        : INT := 0;
@@ -365,7 +365,7 @@ FUNCTION_BLOCK FB_Asrs
     T_TEMP(IN := FALSE, PT := T#1s);
   END_IF;
 
-  (* =================== 1. Girisleri coz =================== *)
+  (* =================== 1. Decode inputs =================== *)
   D_CR_READY    := (IW_DI AND WORD#16#0001) <> WORD#0;
   D_HOMED       := (IW_DI AND WORD#16#0004) <> WORD#0;
   D_FORK_CENTER := (IW_DI AND WORD#16#0008) <> WORD#0;
@@ -383,7 +383,7 @@ FUNCTION_BLOCK FB_Asrs
   RT_START(CLK := START);
   RT_RESET(CLK := RESET);
 
-  (* tablo kalici degil: baslangicta butun gozler belirsiz, sayim yapilir *)
+  (* table is not retained: at start all slots are unknown, a count is done *)
   IF NOT INIT_DONE THEN
     FOR I := 1 TO 36 DO
       LST[I] := 3;
@@ -393,15 +393,15 @@ FUNCTION_BLOCK FB_Asrs
   END_IF;
   IF IO_READY AND NOT SEQ_SYNC THEN
     SEQ := IW_ACK_SEQ;
-    SHIP_DONE := IW_SHIP_REQ;   (* PLC kapaliyken verilen siparisler sayilmaz *)
+    SHIP_DONE := IW_SHIP_REQ;   (* orders issued while the PLC was off are not counted *)
     SEQ_SYNC := TRUE;
   END_IF;
   IF RT_RESET.Q THEN RST_WIN := TRUE; END_IF;
   T_RSTWIN(IN := RST_WIN, PT := T#3s);
   IF T_RSTWIN.Q THEN RST_WIN := FALSE; END_IF;
 
-  (* =================== 2. Goz tablosunu tara =================== *)
-  (* skor: kat*100 + P&D'ye uzaklik*10 + taraf; kucuk olan once *)
+  (* =================== 2. Scan the slot table =================== *)
+  (* score: level*100 + distance to P&D*10 + side; the smaller one first *)
   BEST_E := 0; BEST_ESC := 32000; BEST_U := 0; BEST_USC := 32000;
   OLDEST := 0; OLDEST_ID := 32000; STOCK := 0; UNKNOWN := 0;
   FOR I := 1 TO 36 DO
@@ -420,7 +420,7 @@ FUNCTION_BLOCK FB_Asrs
   FULL := BEST_E = 0 AND UNKNOWN = 0;
   SHIP_PEND := IW_SHIP_REQ <> SHIP_DONE;
 
-  (* =================== 3. Alarmlar =================== *)
+  (* =================== 3. Alarms =================== *)
   IF NOT ESTOP_OK THEN ALARMS := ALARMS OR WORD#16#0001; END_IF;
   IF ESTOP_OK AND NOT D_SAFETY_OK THEN ALARMS := ALARMS OR WORD#16#0002; END_IF;
   IF COMM_FAULT THEN ALARMS := ALARMS OR WORD#16#2000; END_IF;
@@ -444,7 +444,7 @@ FUNCTION_BLOCK FB_Asrs
       MODE := 0;
       IF R_STP = 10 OR R_STP = 11 THEN
         IF JOB = 1 AND LOC >= 1 THEN
-          IF LST[LOC] = 1 THEN LST[LOC] := 0; END_IF;   (* kabul edilmemis depolama: ayirmayi geri al *)
+          IF LST[LOC] = 1 THEN LST[LOC] := 0; END_IF;   (* storage not accepted: undo the reservation *)
         END_IF;
         SEQ := IW_ACK_SEQ;
         R_STP := 0;
@@ -458,19 +458,19 @@ FUNCTION_BLOCK FB_Asrs
   IF MODE = 1 THEN WAIT_START := FALSE; END_IF;
   IF MODE = 1 AND NOT STOP_OK THEN MODE := 0; END_IF;
 
-  (* =================== 4. Vinc isi =================== *)
+  (* =================== 4. Crane job =================== *)
   CASE R_STP OF
     0:
       IF MODE = 1 AND D_CR_READY AND SEQ_SYNC AND NOT HOLD_LATCH THEN
         IF NOT D_HOMED THEN
           JOB := 3; LOC := 0; R_STP := 10;
         ELSIF D_FORK_LOAD THEN
-          IF BEST_E > 0 THEN   (* catalda kalmis palet: yeni goze *)
+          IF BEST_E > 0 THEN   (* pallet left on the forks: to a new slot *)
             JOB := 1; LOC := BEST_E; LST[LOC] := 1; PEND_ID := IW_FORK_ID; R_STP := 10;
           ELSIF BEST_U > 0 THEN
             JOB := 4; LOC := BEST_U; R_STP := 10; (* first prove an empty location *)
           END_IF;
-        ELSIF D_IN_PD AND BEST_E > 0 AND I_STP <> 4 THEN   (* palet numarasi once kaydedilsin *)
+        ELSIF D_IN_PD AND BEST_E > 0 AND I_STP <> 4 THEN   (* let the pallet number be recorded first *)
           JOB := 1; LOC := BEST_E; LST[LOC] := 1; PEND_ID := PD_ID; R_STP := 10;
         ELSIF SHIP_PEND AND OLDEST > 0 AND NOT D_OUT_PD AND O_STP = 0 THEN
           JOB := 2; LOC := OLDEST; R_STP := 10;
@@ -494,7 +494,7 @@ FUNCTION_BLOCK FB_Asrs
             STORED := STORED + 1;
             IF STORED > 30000 THEN STORED := 0; END_IF;
           ELSIF IW_RES_CODE = 11 THEN
-            (* goz dolu cikti: tablo yanlis. Vincin okudugu paleti yaz, alarm *)
+            (* slot turned out to be full: the table is wrong. Record the pallet the crane read, alarm *)
             LST[LOC] := 2; LID[LOC] := IW_RES_ID;
             ALARMS := ALARMS OR WORD#16#0010;
           ELSIF IW_RES_CODE = 10 THEN
@@ -504,7 +504,7 @@ FUNCTION_BLOCK FB_Asrs
             LST[LOC] := 0;
             ALARMS := ALARMS OR WORD#16#0200;
           ELSE
-            LST[LOC] := 3;      (* iptal ya da ariza: goz kontrol edilecek *)
+            LST[LOC] := 3;      (* cancel or fault: the slot will be checked *)
           END_IF;
         ELSIF JOB = 2 THEN
           IF IW_RES_CODE = 1 OR IW_RES_CODE = 17 THEN
@@ -533,10 +533,10 @@ FUNCTION_BLOCK FB_Asrs
       END_IF;
   END_CASE;
 
-  (* =================== 5. Giris ve cikis konveyorleri =================== *)
+  (* =================== 5. Inbound and outbound conveyors =================== *)
   IF MODE = 1 THEN
     CASE I_STP OF
-      0: (* AGV birakti ve catallar disarida; yeniden baslangicta kontrol noktasinda palet varsa olcumu degerlendir *)
+      0: (* AGV dropped off and the forks are outside; on a restart, if there is a pallet at the check point, evaluate the measurement *)
         IF D_IN_CHECK THEN
           I_STP := 2;
         ELSIF D_IN_ENTRY AND AGV_CLEAR_IN THEN
@@ -544,7 +544,7 @@ FUNCTION_BLOCK FB_Asrs
         END_IF;
       1:
         IF D_IN_CHECK THEN I_STP := 2; END_IF;
-      2: (* kontur ve etiket *)
+      2: (* contour and label *)
         IF D_CHECK_DONE THEN
           IF D_CONTOUR_OK AND IW_IN_ID > 0 THEN
             CHK_ID := IW_IN_ID;
@@ -554,11 +554,11 @@ FUNCTION_BLOCK FB_Asrs
             I_STP := 5;
           END_IF;
         END_IF;
-      3: (* P&D bos ve vinc catali ortada olunca *)
+      3: (* when P&D is empty and the crane fork is centered *)
         IF NOT D_IN_PD AND D_FORK_CENTER AND R_STP <> 12 THEN I_STP := 4; END_IF;
       4:
         IF D_IN_PD THEN PD_ID := CHK_ID; I_STP := 0; END_IF;
-      5: (* ret: operator paleti alana kadar *)
+      5: (* reject: until the operator takes the pallet *)
         IF NOT D_IN_CHECK THEN I_STP := 0; END_IF;
     END_CASE;
     CASE O_STP OF
@@ -575,7 +575,7 @@ FUNCTION_BLOCK FB_Asrs
   Q_OUT := MODE = 1 AND O_STP = 1;
   IN_READY := NOT WAIT_START AND NOT D_IN_ENTRY AND NOT Q_IN1 AND IO_READY;
 
-  (* =================== 6. Cikislar =================== *)
+  (* =================== 6. Outputs =================== *)
   QW_DO := WORD#0;
   IF ESTOP_OK AND D_SAFETY_OK AND IO_READY AND NOT COMM_FAULT THEN QW_DO := QW_DO OR WORD#16#0001; END_IF;
   IF HOLD_LATCH THEN QW_DO := QW_DO OR WORD#16#0002; END_IF;
@@ -583,7 +583,7 @@ FUNCTION_BLOCK FB_Asrs
   IF Q_IN1 THEN QW_DO := QW_DO OR WORD#16#0008; END_IF;
   IF Q_IN2 THEN QW_DO := QW_DO OR WORD#16#0010; END_IF;
   IF Q_OUT THEN QW_DO := QW_DO OR WORD#16#0020; END_IF;
-  IF IO_READY THEN QW_DO := QW_DO OR WORD#16#0040; END_IF;          (* sogutma *)
+  IF IO_READY THEN QW_DO := QW_DO OR WORD#16#0040; END_IF;          (* cooling *)
   IF I_STP = 5 THEN QW_DO := QW_DO OR WORD#16#0080; END_IF;
 
   T_TEMP(IN := IW_TEMP > TEMP_MAX, PT := T#30s);
@@ -593,7 +593,7 @@ FUNCTION_BLOCK FB_Asrs
   IF UNKNOWN > 0 THEN WARNS := WARNS OR WORD#16#1000; END_IF;
   QW_ALARM := ALARMS OR WARNS;
 
-  (* PLC envanteri: dolu gozler bit olarak (simulatorle karsilastirmak icin) *)
+  (* PLC inventory: full slots as bits (to compare with the simulator) *)
   OCC_A := WORD#0; OCC_B := WORD#0; OCC_C := WORD#0;
   MASK := WORD#1;
   FOR I := 1 TO 36 DO
@@ -649,81 +649,81 @@ END_FUNCTION_BLOCK
 
 
 (* =====================================================================
-   FB_Dolum - ayran bardak dolum-kapama makinesi (fabrikanin 1. blogu)
+   FB_Dolum - ayran cup fill-and-seal machine (block 1 of the factory)
 
-   Makine: 8 cepli endeksli zincir. Cepler 0..7, istasyonlar:
-     0 Bardak besleme   2 Dolum (terazili, kaba + ince akis)
-     3 Folyo yerlestirme 4 Isil kapama   5 Kontrol tartisi   6 Red
-     7 Cikis bandina aktarim
-   Her endeks adimindan sonra istasyonlar paralel calisir; hepsi
-   bitince bir sonraki adim atilir. Urun kalitesi her cep icin bir
-   kaydirmali kayitta (TR_CUP / TR_BAD) takip edilir.
+   Machine: indexer chain with 8 pockets. Pockets 0..7, stations:
+     0 Cup feed   2 Filling (with scale, coarse + fine flow)
+     3 Foil placement 4 Heat seal   5 Checkweigher   6 Reject
+     7 Transfer to the outfeed belt
+   After each index step the stations work in parallel; when all
+   are finished the next step is taken. Product quality is tracked for each pocket in a
+   shift register (TR_CUP / TR_BAD).
 
-   Operator paneli, acil stop ve haberlesme bekcisi fabrika
-   programindan (Fabrika.st) giris olarak gelir.
+   The operator panel, e-stop and communication watchdog come in as inputs from the factory
+   program (Fabrika.st).
    ===================================================================== *)
 
 FUNCTION_BLOCK FB_Dolum
   VAR_INPUT
     RESTART : BOOL;
-    START, STOP_OK, ESTOP_OK, RESET : BOOL;   (* fabrika paneli *)
-    IO_READY   : BOOL;   (* simulatorden ilk veri geldi *)
-    COMM_FAULT : BOOL;   (* simulator kalp atisi durdu *)
-    IW_DI      : WORD;   (* dijital girisler, bit paketli *)
-    IW_FILL    : INT;    (* dolum terazisi net, 0,1 g *)
-    IW_TANK    : INT;    (* dolum tanki seviyesi, 0,1 % *)
-    IW_TEMP    : INT;    (* kapama kafasi, 0,1 C *)
-    IW_CHECK   : INT;    (* kontrol tartisi brut, 0,1 g *)
+    START, STOP_OK, ESTOP_OK, RESET : BOOL;   (* factory panel *)
+    IO_READY   : BOOL;   (* first data arrived from the simulator *)
+    COMM_FAULT : BOOL;   (* simulator heartbeat stopped *)
+    IW_DI      : WORD;   (* digital inputs, bit-packed *)
+    IW_FILL    : INT;    (* filling scale net, 0.1 g *)
+    IW_TANK    : INT;    (* filling tank level, 0.1 % *)
+    IW_TEMP    : INT;    (* sealing head, 0.1 C *)
+    IW_CHECK   : INT;    (* checkweigher gross, 0.1 g *)
   END_VAR
   VAR_OUTPUT
     QW_STATUS : WORD;
-    QW_DO     : WORD;    (* dijital cikislar, bit paketli *)
+    QW_DO     : WORD;    (* digital outputs, bit-packed *)
     QW_STATE  : INT;
     QW_ALARM  : WORD;
     QW_GOOD   : INT;
     QW_REJECT : INT;
     RUNNING   : BOOL;
-    PRODUCT_REQ : BOOL;  (* dolum tanki %40 altinda: tank istasyonundan urun iste, %80'de birak *)
+    PRODUCT_REQ : BOOL;  (* filling tank below 40%: request product from the tank station, release at 80% *)
   END_VAR
 
   VAR
-    (* ---- Recete ve ayarlar ------------------------------------------ *)
-    FILL_TARGET     : INT := 2060;  (* 206,0 g net = 200 ml ayran *)
-    FILL_TOL        : INT := 40;    (* +/- 4,0 g *)
-    COARSE_MARGIN   : INT := 400;   (* kaba akis hedefin bu kadar altinda kesilir; kendini ayarlar:
-                                       ince akis cok kisa surerse kaba akis asmis demektir *)
-    PREACT          : INT := 20;    (* ucus payi, kendini ayarlar *)
-    TARE            : INT := 49;    (* bardak 4,5 g + folyo 0,4 g *)
+    (* ---- Recipe and settings ------------------------------------------ *)
+    FILL_TARGET     : INT := 2060;  (* 206.0 g net = 200 ml ayran *)
+    FILL_TOL        : INT := 40;    (* +/- 4.0 g *)
+    COARSE_MARGIN   : INT := 400;   (* coarse flow is cut off this far below the target; self-adjusting:
+                                       if fine flow lasts very briefly, coarse flow overshot *)
+    PREACT          : INT := 20;    (* pre-act (in-flight amount), self-adjusting *)
+    TARE            : INT := 49;    (* cup 4.5 g + foil 0.4 g *)
     TEMP_SP         : INT := 1950;
     TEMP_MIN        : INT := 1700;
     TEMP_MAX        : INT := 2200;
-    TANK_ON         : INT := 400;   (* %40 altinda urun iste *)
-    TANK_OFF        : INT := 800;   (* %80 ustunde birak *)
+    TANK_ON         : INT := 400;   (* request product below 40% *)
+    TANK_OFF        : INT := 800;   (* release above 80% *)
   END_VAR
 
   VAR
-    (* ---- Cozulmus girisler ------------------------------------------ *)
+    (* ---- Decoded inputs ------------------------------------------ *)
     DI_START, DI_STOP_OK, DI_ESTOP_OK, DI_RESET, DI_INDEX, DI_CUP_EMPTY,
     DI_CUP_AT_FILL, DI_NOZ_UP, DI_NOZ_DN, DI_FOIL_EMPTY, DI_FOIL_AT_SEAL,
     DI_SEAL_UP, DI_SEAL_DN, DI_TANK_LOW, DI_CUP_AT_REJ, DI_REJ_EXT,
     DI_OUT_FULL : BOOL;
 
-    (* ---- Cikislar ---------------------------------------------------- *)
+    (* ---- Outputs ---------------------------------------------------- *)
     Q_CONV, Q_CUP_DROP, Q_NOZ_DN, Q_FILL_FAST, Q_FILL_FINE, Q_FOIL,
     Q_SEAL_DN, Q_HEATER, Q_REJECT, Q_GREEN, Q_YELLOW,
     Q_RED, Q_HORN : BOOL;
 
-    (* ---- Durum ------------------------------------------------------- *)
+    (* ---- State ------------------------------------------------------- *)
     WAIT_START : BOOL := TRUE;
-    MODE      : INT := 0;   (* 0 dur, 1 calis, 2 cevrim sonu dur, 3 alarm, 4 acil stop *)
-    CYC       : INT := 0;   (* 0 hazir, 10/11 endeks, 20 istasyonlar *)
+    MODE      : INT := 0;   (* 0 stopped, 1 running, 2 stop at end of cycle, 3 alarm, 4 e-stop *)
+    CYC       : INT := 0;   (* 0 ready, 10/11 index, 20 stations *)
     HEAT_WAIT : BOOL;
     PURGE : INT;
-    OUT_WAIT  : BOOL;       (* cikis bandi dolu, endeks bekliyor *)
+    OUT_WAIT  : BOOL;       (* outfeed belt full, index waiting *)
     TEMP_OK   : BOOL;
     ALARMS_BEFORE : WORD;
-    ALARMS    : WORD;       (* mandalli alarmlar, bit 0..7 *)
-    WARNS     : WORD;       (* canli uyarilar, bit 8..10 *)
+    ALARMS    : WORD;       (* latched alarms, bits 0..7 *)
+    WARNS     : WORD;       (* live warnings, bits 8..10 *)
     ALARM_ANY : BOOL;
     ALARM_PREV: BOOL;
     HORN_LATCH: BOOL;
@@ -731,22 +731,22 @@ FUNCTION_BLOCK FB_Dolum
     BLINK     : BOOL;
     GOOD_CNT  : INT;
     REJ_CNT   : INT;
-    LINE_EMPTY : BOOL;      (* OEE: zincirde takip edilen bardak yok *)
+    LINE_EMPTY : BOOL;      (* OEE: no tracked cup on the chain *)
     K         : INT;
 
-    (* ---- Urun takibi (cep basina) ------------------------------------ *)
+    (* ---- Product tracking (per pocket) ------------------------------------ *)
     TR_CUP : ARRAY[0..7] OF BOOL;
     TR_BAD : ARRAY[0..7] OF BOOL;
     I      : INT;
 
-    (* ---- Istasyon adimlari (9 = bitti) -------------------------------- *)
+    (* ---- Station steps (9 = done) -------------------------------- *)
     DROP_SUB, FILL_SUB, FOIL_SUB, SEAL_SUB, CHK_SUB, REJ_SUB : INT := 9;
     FILL_ERR : INT;
     CHK_NET  : INT;
 
-    (* ---- Zamanlayicilar ve kenar algilayicilar ------------------------ *)
-    (* Not: matiec, uzun bir TON listesini tek bildirimde verince cokuyor;
-       her zamanlayici ayri satirda. *)
+    (* ---- Timers and edge detectors ------------------------ *)
+    (* Note: matiec crashes when a long list of TONs is given in a single declaration;
+       each timer is on a separate line. *)
     RT_START  : R_TRIG;
     RT_RESET  : R_TRIG;
     T_HEAT    : TON;
@@ -791,7 +791,7 @@ FUNCTION_BLOCK FB_Dolum
     T_BLINK_B(IN := FALSE, PT := T#1s);
   END_IF;
 
-  (* =================== 1. Girisleri coz =================== *)
+  (* =================== 1. Decode inputs =================== *)
   DI_START        := START;
   DI_STOP_OK      := STOP_OK;
   DI_ESTOP_OK     := ESTOP_OK;
@@ -814,12 +814,12 @@ FUNCTION_BLOCK FB_Dolum
   RT_RESET(CLK := DI_RESET);
   TEMP_OK := (IW_TEMP >= TEMP_MIN) AND (IW_TEMP <= TEMP_MAX);
 
-  (* =================== 2. Guvenlik ve izleme =================== *)
+  (* =================== 2. Safety and monitoring =================== *)
   IF COMM_FAULT THEN ALARMS := ALARMS OR WORD#16#0080; END_IF;
 
   IF NOT DI_ESTOP_OK THEN ALARMS := ALARMS OR WORD#16#0001; END_IF;
 
-  (* Isitici: +/- 2 C histerezisli termostat *)
+  (* Heater: thermostat with +/- 2 C hysteresis *)
   IF NOT DI_ESTOP_OK THEN
     Q_HEATER := FALSE;
   ELSIF IW_TEMP < TEMP_SP - 20 THEN
@@ -827,26 +827,26 @@ FUNCTION_BLOCK FB_Dolum
   ELSIF IW_TEMP > TEMP_SP + 20 THEN
     Q_HEATER := FALSE;
   END_IF;
-  (* 45 s isitip hala soguksa rezistans arizalidir; reset sayaci yeniden baslatir *)
-  (* isinma bekcisi yalnizca isitici gercekten surulurken sayar: acilista START beklenirken
-     cikis kapalidir (asagidaki maske), soguyan isitici sahte alarm vermesin *)
+  (* if it is still cold after heating for 45 s the heating element is faulty; reset restarts the counter *)
+  (* the warm-up watchdog counts only while the heater is really driven: at power-up, while waiting for START,
+     the output is off (mask below), so a cooling heater does not give a false alarm *)
   T_HEAT(IN := Q_HEATER AND NOT WAIT_START AND IO_READY AND (IW_TEMP < TEMP_MIN) AND NOT RT_RESET.Q, PT := T#45s);
   IF T_HEAT.Q THEN ALARMS := ALARMS OR WORD#16#0020; END_IF;
 
-  (* Dolum tanki seviyesi: urun iste (hucre sozlesmesi). Vanayi ve pompayi
-     tank istasyonu yonetir; bu blok yalnizca ne zaman urun gerektigini bilir. *)
+  (* Filling tank level: request product (cell contract). The valve and the pump
+     are managed by the tank station; this block only knows when product is needed. *)
   IF NOT IO_READY THEN
-    PRODUCT_REQ := FALSE;              (* ilk veri gelmeden seviye 0 gorunur *)
+    PRODUCT_REQ := FALSE;              (* before the first data arrives the level reads 0 *)
   ELSIF IW_TANK < TANK_ON THEN
     PRODUCT_REQ := TRUE;
   ELSIF IW_TANK > TANK_OFF THEN
     PRODUCT_REQ := FALSE;
   END_IF;
 
-  (* Ilk veri gelene kadar girisler sifirdir; bu sirada alarm uretme *)
+  (* Inputs are zero until the first data arrives; do not raise alarms meanwhile *)
   IF NOT IO_READY THEN ALARMS := ALARMS_BEFORE; END_IF;
 
-  (* =================== 3. Mod yonetimi =================== *)
+  (* =================== 3. Mode management =================== *)
   ALARM_ANY := (ALARMS AND WORD#16#00FF) <> WORD#0;
   IF ALARM_ANY THEN
     IF NOT DI_ESTOP_OK OR MODE = 4 OR (ALARMS AND WORD#16#0001) <> WORD#0 THEN
@@ -864,12 +864,12 @@ FUNCTION_BLOCK FB_Dolum
     IF DI_ESTOP_OK AND NOT COMM_FAULT THEN
       ALARMS := WORD#0;
       IF MODE = 3 OR MODE = 4 THEN
-        (* yarim kalan istasyonlardaki bardaklar hatali sayilir *)
+        (* cups at unfinished stations are counted as bad *)
         IF FILL_SUB <> 9 AND TR_CUP[2] THEN TR_BAD[2] := TRUE; END_IF;
         IF FOIL_SUB <> 9 AND TR_CUP[3] THEN TR_BAD[3] := TRUE; END_IF;
         IF SEAL_SUB <> 9 AND TR_CUP[4] THEN TR_BAD[4] := TRUE; END_IF;
         DROP_SUB := 9; FILL_SUB := 9; FOIL_SUB := 9; SEAL_SUB := 9;
-        (* tarti ve red tekrarlanabilir: bastan calistir *)
+        (* weighing and reject can be repeated: run them from the start *)
         IF CHK_SUB <> 9 THEN CHK_SUB := 0; END_IF;
         IF REJ_SUB = 2 THEN
           REJ_CNT := REJ_CNT + 1;
@@ -889,7 +889,7 @@ FUNCTION_BLOCK FB_Dolum
   IF MODE = 1 THEN WAIT_START := FALSE; END_IF;
   IF MODE = 1 AND NOT DI_STOP_OK THEN MODE := 2; END_IF;
 
-  (* =================== 4. Endeks cevrimi =================== *)
+  (* =================== 4. Index cycle =================== *)
   T_IDX(IN := (MODE = 1 OR MODE = 2) AND (CYC = 10 OR CYC = 11), PT := T#2s);
   IF T_IDX.Q THEN ALARMS := ALARMS OR WORD#16#0002; END_IF;
 
@@ -900,7 +900,7 @@ FUNCTION_BLOCK FB_Dolum
       ELSIF NOT TEMP_OK THEN
         HEAT_WAIT := TRUE;
       ELSIF TR_CUP[7] AND DI_OUT_FULL THEN
-        (* son cepteki bardak dolu banda itilirdi: bant bosalana kadar bekle *)
+        (* the cup in the last pocket would be pushed onto the full belt: wait until the belt clears *)
         HEAT_WAIT := FALSE;
         OUT_WAIT := TRUE;
       ELSE
@@ -909,7 +909,7 @@ FUNCTION_BLOCK FB_Dolum
         CYC := 10;
       END_IF;
     ELSIF CYC = 10 THEN
-      (* endeksleyiciyi tetikle; hareket baslayinca tetigi birak *)
+      (* trigger the indexer; release the trigger when the motion starts *)
       Q_CONV := TRUE;
       IF NOT DI_INDEX THEN
         Q_CONV := FALSE;
@@ -918,7 +918,7 @@ FUNCTION_BLOCK FB_Dolum
     ELSIF CYC = 11 THEN
       IF DI_INDEX THEN
         IF PURGE > 0 THEN PURGE := PURGE - 1; END_IF;
-        (* bardaklar bir cep ilerledi: takip kaydini kaydir *)
+        (* cups advanced one pocket: shift the tracking register *)
         FOR I := 7 TO 1 BY -1 DO
           TR_CUP[I] := TR_CUP[I - 1];
           TR_BAD[I] := TR_BAD[I - 1];
@@ -932,7 +932,7 @@ FUNCTION_BLOCK FB_Dolum
     END_IF;
   END_IF;
 
-  (* =================== 5. Istasyonlar =================== *)
+  (* =================== 5. Stations =================== *)
   T_DROP(IN := DROP_SUB = 1, PT := T#300ms);
   T_DROPWAIT(IN := DROP_SUB = 2, PT := T#400ms);
   T_NOZ(IN := FILL_SUB = 1 OR FILL_SUB = 5, PT := T#2s);
@@ -948,14 +948,14 @@ FUNCTION_BLOCK FB_Dolum
 
   IF (MODE = 1 OR MODE = 2) AND CYC = 20 THEN
 
-    (* --- Cep 0: bardak besleme --- *)
+    (* --- Pocket 0: cup feed --- *)
     CASE DROP_SUB OF
       0:
         IF MODE = 1 AND NOT DI_CUP_EMPTY THEN
           Q_CUP_DROP := TRUE;
           DROP_SUB := 1;
         ELSE
-          DROP_SUB := 9;   (* magazin bos ya da hat bosaltiliyor *)
+          DROP_SUB := 9;   (* magazine empty or the line is being emptied *)
         END_IF;
       1:
         IF T_DROP.Q THEN
@@ -964,20 +964,20 @@ FUNCTION_BLOCK FB_Dolum
           DROP_SUB := 2;
         END_IF;
       2:
-        (* bardak duserken zincir oynamasin: dusus + haberlesme gecikmesi kadar bekle *)
+        (* the chain must not move while the cup drops: wait for the drop + communication delay *)
         IF T_DROPWAIT.Q THEN DROP_SUB := 9; END_IF;
     END_CASE;
 
-    (* --- Cep 2: terazili dolum --- *)
+    (* --- Pocket 2: filling with scale --- *)
     CASE FILL_SUB OF
       0:
-        TR_CUP[2] := DI_CUP_AT_FILL;          (* sensor takip kaydini duzeltir *)
+        TR_CUP[2] := DI_CUP_AT_FILL;          (* the sensor corrects the tracking register *)
         IF NOT DI_CUP_AT_FILL THEN
           FILL_SUB := 9;
         ELSIF NOT DI_TANK_LOW THEN
           Q_NOZ_DN := TRUE;
           FILL_SUB := 1;
-        END_IF;                               (* tank alt seviyede: bekle *)
+        END_IF;                               (* tank at low level: wait *)
       1:
         IF DI_NOZ_DN THEN
           Q_FILL_FAST := TRUE;
@@ -994,7 +994,7 @@ FUNCTION_BLOCK FB_Dolum
       3:
         IF IW_FILL >= FILL_TARGET - PREACT THEN
           Q_FILL_FINE := FALSE;
-          (* kaba akis kesme noktasini ince akis suresine gore ayarla *)
+          (* adjust the coarse flow cut-off point according to the fine flow time *)
           IF T_FINE.ET < T#500ms THEN
             COARSE_MARGIN := COARSE_MARGIN + 100;
             IF COARSE_MARGIN > 1200 THEN COARSE_MARGIN := 1200; END_IF;
@@ -1007,7 +1007,7 @@ FUNCTION_BLOCK FB_Dolum
       4:
         IF T_SETTLE.Q THEN
           FILL_ERR := IW_FILL - FILL_TARGET;
-          (* ucus payini son hataya gore ayarla *)
+          (* adjust the pre-act according to the last error *)
           IF ABS(FILL_ERR) < 100 THEN
             PREACT := PREACT + FILL_ERR / 2;
             IF PREACT < 0 THEN PREACT := 0; END_IF;
@@ -1033,7 +1033,7 @@ FUNCTION_BLOCK FB_Dolum
       FILL_SUB := 5;
     END_IF;
 
-    (* --- Cep 3: folyo yerlestirme --- *)
+    (* --- Pocket 3: foil placement --- *)
     CASE FOIL_SUB OF
       0:
         IF NOT TR_CUP[3] THEN
@@ -1051,13 +1051,13 @@ FUNCTION_BLOCK FB_Dolum
         END_IF;
     END_CASE;
 
-    (* --- Cep 4: isil kapama --- *)
+    (* --- Pocket 4: heat seal --- *)
     CASE SEAL_SUB OF
       0:
         IF NOT TR_CUP[4] THEN
           SEAL_SUB := 9;
         ELSIF NOT DI_FOIL_AT_SEAL OR NOT TEMP_OK THEN
-          TR_BAD[4] := TRUE;                  (* folyosuz bardaga kafa inmez *)
+          TR_BAD[4] := TRUE;                  (* the head does not descend onto a cup without foil *)
           SEAL_SUB := 9;
         ELSE
           Q_SEAL_DN := TRUE;
@@ -1083,14 +1083,14 @@ FUNCTION_BLOCK FB_Dolum
         END_IF;
     END_CASE;
 
-    (* --- Cep 5: kontrol tartisi --- *)
+    (* --- Pocket 5: checkweigher --- *)
     CASE CHK_SUB OF
       0:
         IF TR_CUP[5] THEN CHK_SUB := 1; ELSE CHK_SUB := 9; END_IF;
       1:
         IF T_CHK.Q THEN
           IF IW_CHECK < 20 THEN
-            TR_CUP[5] := FALSE;               (* bardak yolda kaybolmus *)
+            TR_CUP[5] := FALSE;               (* the cup was lost on the way *)
           ELSE
             CHK_NET := IW_CHECK - TARE;
             IF ABS(CHK_NET - FILL_TARGET) > FILL_TOL THEN TR_BAD[5] := TRUE; END_IF;
@@ -1099,7 +1099,7 @@ FUNCTION_BLOCK FB_Dolum
         END_IF;
     END_CASE;
 
-    (* --- Cep 6: red --- *)
+    (* --- Pocket 6: reject --- *)
     (* Blind pockets: reject every old cup, using actual presence at the reject photocell. *)
     IF REJ_SUB = 0 AND PURGE > 0 AND DI_CUP_AT_REJ THEN TR_CUP[6] := TRUE; TR_BAD[6] := TRUE; END_IF;
     CASE REJ_SUB OF
@@ -1135,14 +1135,14 @@ FUNCTION_BLOCK FB_Dolum
     END_IF;
   END_IF;
 
-  (* =================== 6. Alarmda hareketleri durdur =================== *)
+  (* =================== 6. Stop motions on alarm =================== *)
   IF MODE = 3 OR MODE = 4 THEN
     Q_CONV := FALSE; Q_CUP_DROP := FALSE; Q_NOZ_DN := FALSE;
     Q_FILL_FAST := FALSE; Q_FILL_FINE := FALSE; Q_FOIL := FALSE;
     Q_SEAL_DN := FALSE; Q_REJECT := FALSE;
   END_IF;
 
-  (* =================== 7. Kule lambasi =================== *)
+  (* =================== 7. Tower light =================== *)
   T_BLINK_A(IN := NOT BLINK, PT := T#500ms);
   IF T_BLINK_A.Q THEN BLINK := TRUE; END_IF;
   T_BLINK_B(IN := BLINK, PT := T#500ms);
@@ -1160,7 +1160,7 @@ FUNCTION_BLOCK FB_Dolum
   Q_RED    := (MODE = 3 OR MODE = 4) AND (BLINK OR NOT HORN_LATCH);
   Q_HORN   := HORN_LATCH;
 
-  (* =================== 8. Cikislari paketle =================== *)
+  (* =================== 8. Pack the outputs =================== *)
   QW_DO := WORD#0;
   IF Q_CONV      THEN QW_DO := QW_DO OR WORD#16#0001; END_IF;
   IF Q_CUP_DROP  THEN QW_DO := QW_DO OR WORD#16#0002; END_IF;
@@ -1176,8 +1176,8 @@ FUNCTION_BLOCK FB_Dolum
   IF Q_RED       THEN QW_DO := QW_DO OR WORD#16#1000; END_IF;
   IF Q_HORN      THEN QW_DO := QW_DO OR WORD#16#2000; END_IF;
 
-  (* OEE icin bekleme nedeni: 7 urun yok (dolumda bardak var, tank alt seviyede),
-     8 bardak yok (magazin bos ve zincir bosaldi) *)
+  (* waiting reason for OEE: 7 no product (cup at filling, tank at low level),
+     8 no cup (magazine empty and the chain has emptied) *)
   LINE_EMPTY := TRUE;
   FOR K := 0 TO 7 DO
     IF TR_CUP[K] THEN LINE_EMPTY := FALSE; END_IF;
@@ -1194,7 +1194,7 @@ FUNCTION_BLOCK FB_Dolum
     QW_STATE := MODE;
   END_IF;
   QW_ALARM  := ALARMS OR WARNS;
-  (* sayaclar 0..30000 sarar (izleme katmani bu kurala gore fark alir) *)
+  (* counters wrap within 0..30000 (the monitoring layer takes differences according to this rule) *)
   IF GOOD_CNT > 30000 THEN GOOD_CNT := 0; END_IF;
   IF REJ_CNT > 30000 THEN REJ_CNT := 0; END_IF;
   QW_GOOD   := GOOD_CNT;
@@ -1210,28 +1210,28 @@ END_FUNCTION_BLOCK
 
 
 (* =====================================================================
-   FB_Pallet - robotlu paletleme, palet hatti ve strec sarma (4. blok)
+   FB_Pallet - robotic palletizing, pallet line and stretch wrapping (block 4)
 
-   Robot arayuzu (robot kontrolcusu kendi programini calistirir):
-     PLC -> robot : JOB, SLOT, SEQ. SEQ degisince is baslar; ayni SEQ ikinci
-                    kez calismaz. Is numarasi blok halinde (tek FC16) yazilir.
-     robot -> PLC : ACK_SEQ (is kabul edildi), RES_SEQ + RES_CODE + RES_SLOT
-                    (is bitti). Sonuc kaydi kalicidir.
-   Paletteki paket sayisi yalnizca robot "tamam" (1) ya da "birakildi,
-   sonra iptal" (17) dedikten sonra artar. Dusen paketin slotu bos kalir,
-   bir sonraki paket ayni slota konur. Zaman asiminda is kor olarak
-   tekrarlanmaz: alarm verilir.
+   Robot interface (the robot controller runs its own program):
+     PLC -> robot : JOB, SLOT, SEQ. The job starts when SEQ changes; the same SEQ does not
+                    run a second time. The job number is written as a block (single FC16).
+     robot -> PLC : ACK_SEQ (job accepted), RES_SEQ + RES_CODE + RES_SLOT
+                    (job finished). The result record is retained.
+   The pack count on the pallet increases only after the robot says "done" (1) or "released,
+   then cancelled" (17). The slot of a dropped pack stays empty,
+   and the next pack is placed in the same slot. On a timeout the job is not blindly
+   repeated: an alarm is raised.
 
-   Is secimi (her is bitince yeniden): konum dogrulanmamissa eve don; tutucuda
-   paket varsa bir sonraki slota birak; palet yeni geldiyse alt karton;
-   palet doluysa ust karton; aksi halde alma noktasindaki paketi al. Palet
-   degisirken onceden paket alinmaz: tutucu kartonu da tasidigi icin elinde
-   paketle alt kartonu koyamaz (kilitlenme).
+   Job selection (again after every job): if the position is not verified, go home; if the gripper
+   holds a pack, place it in the next slot; if the pallet has just arrived, the bottom sheet;
+   if the pallet is full, the top sheet; otherwise pick the pack at the pickup point. While the pallet
+   is changing, no pack is picked in advance: because the gripper also carries the sheet, it cannot
+   place the bottom sheet with a pack in hand (deadlock).
 
-   Guvenlik (kapi, isik perdesi, muting, acil stop) simulatordeki bagimsiz
-   guvenlik kontrolcusundedir; bu blok yalnizca durumunu okur. Reset hareket
-   baslatmaz: alarmdan sonra robot HOLD'da kalir, Start ile devam eder.
-   Sertifikali bir guvenlik tasarimi degildir.
+   Safety (door, light curtain, muting, e-stop) is in the independent safety controller
+   in the simulator; this block only reads its status. Reset does not start a movement:
+   after an alarm the robot stays in HOLD and continues with Start.
+   This is not a certified safety design.
    ===================================================================== *)
 
 FUNCTION_BLOCK FB_Pallet
@@ -1264,7 +1264,7 @@ FUNCTION_BLOCK FB_Pallet
     IW_TURNS    : INT;
     IW_PALLETS  : INT;
     IW_SHEETS   : INT;
-    AGV_CLEAR   : BOOL;   (* AGV catallari alim noktasinin disinda *)
+    AGV_CLEAR   : BOOL;   (* AGV forks are outside the pickup point *)
   END_VAR
   VAR_OUTPUT
     QW_DO        : WORD;
@@ -1278,13 +1278,13 @@ FUNCTION_BLOCK FB_Pallet
     QW_DONE      : INT;
     QW_PALLET_ID : INT;
     QW_WRAPPED   : INT;
-    PICKUP_RDY   : BOOL;  (* AGV'ye: palet D'de, D konveyoru duruyor *)
+    PICKUP_RDY   : BOOL;  (* to the AGV: pallet at D, D conveyor stopped *)
     RUNNING      : BOOL;
   END_VAR
 
   VAR
-    SLOTS      : INT := 18;     (* 3 kat x 6 paket *)
-    MIN_TURNS  : INT := 9;      (* strec recetesi: 3 alt + 2 cikis + 2 ust + 2 inis *)
+    SLOTS      : INT := 18;     (* 3 layers x 6 packs *)
+    MIN_TURNS  : INT := 9;      (* stretch recipe: 3 bottom + 2 climb + 2 top + 2 descent *)
     ALARM_MASK : WORD := WORD#16#63FF;
   END_VAR
 
@@ -1300,11 +1300,11 @@ FUNCTION_BLOCK FB_Pallet
     RECOVER_SEQ : INT;
     LAST_SEQ : INT;
     NEXT_SEQ : INT;
-    MODE      : INT := 0;    (* 0 dur, 1 calis, 3 alarm, 4 acil stop *)
-    A_STP     : INT := 0;    (* bos palet besleme *)
-    B_STP     : INT := 0;    (* istif konumu *)
-    C_STP     : INT := 0;    (* strec ve cikis *)
-    R_STP     : INT := 0;    (* robot isi *)
+    MODE      : INT := 0;    (* 0 stopped, 1 running, 3 alarm, 4 e-stop *)
+    A_STP     : INT := 0;    (* empty pallet feed *)
+    B_STP     : INT := 0;    (* stacking position *)
+    C_STP     : INT := 0;    (* stretch and exit *)
+    R_STP     : INT := 0;    (* robot job *)
     JOB       : INT := 0;
     SLOT      : INT := 0;
     SEQ       : INT := 0;
@@ -1357,7 +1357,7 @@ FUNCTION_BLOCK FB_Pallet
     T_WRAP(IN := FALSE, PT := T#1s);
   END_IF;
 
-  (* =================== 1. Girisleri coz =================== *)
+  (* =================== 1. Decode inputs =================== *)
   DI_PICK       := (IW_DI AND WORD#16#0001) <> WORD#0;
   DI_PAL_A      := (IW_DI AND WORD#16#0002) <> WORD#0;
   DI_PAL_B      := (IW_DI AND WORD#16#0004) <> WORD#0;
@@ -1481,18 +1481,18 @@ FUNCTION_BLOCK FB_Pallet
     RECOVERING := FALSE; BOOK_OK := FALSE;
   END_IF;
 
-  (* ilk gecerli veride robotun numaralandirmasindan devam et (PLC yeniden basladiysa ayni SEQ'i tekrar gonderme) *)
+  (* continue from the robot's numbering on the first valid data (if the PLC restarted, do not send the same SEQ again) *)
   IF IO_READY AND NOT SEQ_SYNC THEN
     SEQ := IW_ACK_SEQ;
     SEQ_SYNC := TRUE;
   END_IF;
 
-  (* reset penceresi: guvenlik kontrolcusu ve robot resetin etkisini 0,5 s gecikmeyle bildirir *)
+  (* reset window: the safety controller and the robot report the effect of the reset with a 0.5 s delay *)
   IF RT_RESET.Q THEN RST_WIN := TRUE; END_IF;
   T_RSTWIN(IN := RST_WIN, PT := T#3s);
   IF T_RSTWIN.Q THEN RST_WIN := FALSE; END_IF;
 
-  (* =================== 2. Alarmlar =================== *)
+  (* =================== 2. Alarms =================== *)
   IF NOT ESTOP_OK THEN ALARMS := ALARMS OR WORD#16#0001; END_IF;
   IF ESTOP_OK AND NOT DI_SAFETY_OK THEN ALARMS := ALARMS OR WORD#16#0002; END_IF;
   IF R_ERROR THEN ALARMS := ALARMS OR WORD#16#0004; END_IF;
@@ -1514,7 +1514,7 @@ FUNCTION_BLOCK FB_Pallet
 
   IF (ALARMS AND ALARM_MASK) <> WORD#0 THEN
     IF (ALARMS AND WORD#16#0001) <> WORD#0 THEN MODE := 4; ELSIF MODE <> 4 THEN MODE := 3; END_IF;
-    HOLD_LATCH := TRUE;   (* robot Start'a kadar duraklatilmis kalir *)
+    HOLD_LATCH := TRUE;   (* the robot stays paused until Start *)
   END_IF;
 
   IF RST_WIN AND ESTOP_OK AND DI_SAFETY_OK AND NOT COMM_FAULT AND NOT DI_WRAP_FAULT AND NOT R_ERROR THEN
@@ -1522,7 +1522,7 @@ FUNCTION_BLOCK FB_Pallet
     RST_WIN := FALSE;
     IF MODE = 3 OR MODE = 4 THEN
       MODE := 0;
-      (* kabul edilmemis isi geri al: robot ayni numarayi gorurse bir sey yapmaz *)
+      (* take back the job that was not accepted: if the robot sees the same number it does nothing *)
       IF R_STP = 10 OR R_STP = 11 THEN
         SEQ := IW_ACK_SEQ;
         R_STP := 0;
@@ -1535,7 +1535,7 @@ FUNCTION_BLOCK FB_Pallet
     HOLD_LATCH := NOT ROB_BOOT_OK;
   END_IF;
   IF MODE = 1 THEN WAIT_START := FALSE; END_IF;
-  IF MODE = 1 AND NOT STOP_OK THEN MODE := 0; END_IF;   (* cevrim sonu: robot elindeki isi bitirir *)
+  IF MODE = 1 AND NOT STOP_OK THEN MODE := 0; END_IF;   (* end of cycle: the robot finishes the job in hand *)
 
   (* READY means idle; accepted work is resumed without an impossible READY/home
      prerequisite. Idle loaded/off-home robots use the existing place/home branches. *)
@@ -1546,8 +1546,8 @@ FUNCTION_BLOCK FB_Pallet
   IF NOT ROB_BOOT_OK THEN HOLD_LATCH := TRUE; END_IF;
   IF MODE = 1 AND ROB_BOOT_OK AND (ALARMS AND ALARM_MASK) = WORD#0 THEN HOLD_LATCH := FALSE; END_IF;
 
-  (* =================== 3. Robot isi =================== *)
-  (* sonuc degerlendirmesi her modda calisir; yeni is yalnizca calisirken verilir *)
+  (* =================== 3. Robot job =================== *)
+  (* result evaluation runs in every mode; a new job is issued only while running *)
   CASE R_STP OF
     0:
       IF MODE = 1 AND BOOK_OK AND NOT RECOVERING AND R_READY AND SEQ_SYNC AND NOT HOLD_LATCH THEN
@@ -1566,13 +1566,13 @@ FUNCTION_BLOCK FB_Pallet
         END_IF;
         IF R_STP = 10 THEN ROB_BOOT_DONE := TRUE; END_IF;
       END_IF;
-    10: (* yeni is numarasi; JOB, SLOT ve SEQ ayni yazmada gider *)
+    10: (* new job number; JOB, SLOT and SEQ go out in the same write *)
       SEQ := SEQ + 1;
       IF SEQ > 30000 THEN SEQ := 1; END_IF;
       R_STP := 11;
-    11: (* kabul bekle *)
+    11: (* wait for acceptance *)
       IF IW_RES_SEQ = SEQ OR IW_ACK_SEQ = SEQ THEN R_STP := 12; END_IF;
-    12: (* sonuc bekle *)
+    12: (* wait for result *)
       IF IW_RES_SEQ = SEQ THEN
         R_STP := 0;
         LAST_SEQ := IW_RES_SEQ;
@@ -1595,13 +1595,13 @@ FUNCTION_BLOCK FB_Pallet
         ELSIF IW_RES_CODE = 12 OR IW_RES_CODE = 16 THEN
           ALARMS := ALARMS OR WORD#16#0200;
         END_IF;
-        (* 13 = iptal: sayac degismez, is yeniden secilir *)
+        (* 13 = cancelled: the counter does not change, the job is selected again *)
       END_IF;
   END_CASE;
 
-  (* =================== 4. Palet hatti =================== *)
+  (* =================== 4. Pallet line =================== *)
   IF MODE = 1 AND NOT RECOVERING THEN
-    (* A: bos palet besleme; istif konumu dolarken bile bir sonraki palet hazirlanir *)
+    (* A: empty pallet feed; the next pallet is prepared even while the stacking position is filling *)
     CASE A_STP OF
       0:
         IF NOT DI_PAL_A AND NOT DI_DISP_BUSY AND IW_PALLETS > 0 AND B_STP <> 2 THEN A_STP := 1; END_IF;
@@ -1609,7 +1609,7 @@ FUNCTION_BLOCK FB_Pallet
         IF DI_PAL_A THEN A_STP := 0; END_IF;
     END_CASE;
 
-    (* B: istif konumu *)
+    (* B: stacking position *)
     CASE B_STP OF
       0:
         IF DI_PAL_B THEN
@@ -1617,20 +1617,20 @@ FUNCTION_BLOCK FB_Pallet
         ELSIF DI_PAL_A AND A_STP = 0 THEN
           B_STP := 2;
         END_IF;
-      2: (* A -> B, pim yukarida *)
+      2: (* A -> B, pin up *)
         IF DI_PAL_B THEN B_STP := 3; END_IF;
-      3: (* yeni palet: defter sifirlanir *)
+      3: (* new pallet: the ledger is reset *)
         PALLET_ID := PALLET_ID + 1;
         IF PALLET_ID > 30000 THEN PALLET_ID := 1; END_IF;
         COUNT := 0;
         SHEET_BOT := FALSE;
         SHEET_TOP := FALSE;
         B_STP := 10;
-      10: (* istif *)
+      10: (* stacking *)
         IF COUNT >= SLOTS AND SHEET_TOP THEN B_STP := 20; END_IF;
-      20: (* palet dolu: robot bolge disinda, strec bos ve tabla baslangicta olunca birak *)
+      20: (* pallet full: release when the robot is outside the zone, the stretch wrapper is empty and the turntable is at its start position *)
         IF R_CLEAR AND R_STP = 0 AND C_STP = 0 AND NOT DI_PAL_C AND DI_WRAP_HOME THEN B_STP := 21; END_IF;
-      21: (* pim asagi, B -> C *)
+      21: (* pin down, B -> C *)
         IF DI_PAL_C AND NOT DI_PAL_B THEN
           DONE_CNT := DONE_CNT + 1;
           IF DONE_CNT > 30000 THEN DONE_CNT := 0; END_IF;
@@ -1639,11 +1639,11 @@ FUNCTION_BLOCK FB_Pallet
         END_IF;
     END_CASE;
 
-    (* C: strec sarma ve alim noktasina cikis *)
+    (* C: stretch wrapping and exit to the pickup point *)
     CASE C_STP OF
       0:
         IF DI_PAL_C AND B_STP <> 21 THEN C_STP := 1; END_IF;
-      1: (* istek "bitti" gelene kadar tutulur *)
+      1: (* the request is held until "done" arrives *)
         IF DI_WRAP_DONE THEN
           UNDERWRAP := IW_TURNS < MIN_TURNS;
           WRAPPED := WRAPPED + 1;
@@ -1652,14 +1652,14 @@ FUNCTION_BLOCK FB_Pallet
         END_IF;
       2:
         IF NOT DI_WRAP_DONE AND DI_WRAP_HOME THEN C_STP := 3; END_IF;
-      3: (* alim noktasi bos ve AGV catallari disarida olunca *)
+      3: (* when the pickup point is empty and the AGV forks are outside *)
         IF NOT DI_PAL_D AND AGV_CLEAR THEN C_STP := 4; END_IF;
-      4: (* C -> D; isik perdesi muting'i palet gecerken guvenlik kontrolcusunde *)
+      4: (* C -> D; the light curtain muting while the pallet passes is in the safety controller *)
         IF DI_PAL_D AND NOT DI_PAL_C THEN C_STP := 0; END_IF;
     END_CASE;
   END_IF;
 
-  (* =================== 5. Cikislar =================== *)
+  (* =================== 5. Outputs =================== *)
   IF BOOK_OK THEN
     RET_MAGIC := WORD#0; (* invalidate before payload, commit last *)
     RET_MAPVER := 7;
@@ -1766,21 +1766,21 @@ END_FUNCTION_BLOCK
 
 
 (* =====================================================================
-   FB_Shrink - gruplama, shrink sarma ve shrink firini (fabrikanin 3. blogu)
+   FB_Shrink - grouping, shrink wrapping and shrink tunnel (block 3 of the factory)
 
-   Gruplama: altlik yerlestir -> serit 3 bardakla dolunca giris kapisini
-   kapat -> sira iticisi -> iki sira olunca grup iticisi sarma makinesine.
-   Sarma: istek "bitti" gelene kadar tutulur (kisa darbe Modbus gecikmesinde
-   kaybolabilir). Birakma izni: firin sicakta, cikis bos, bant donuyor.
+   Grouping: place pad -> when the lane is full with 3 cups, close the infeed
+   gate -> row pusher -> when there are two rows, the group pusher moves them to the wrapping machine.
+   Wrapping: the request is held until "done" arrives (a short pulse can
+   be lost with Modbus delay). Release permission: tunnel hot, outfeed empty, belt running.
 
-   Firin: +/- 3 C termostat. Fan donmuyorsa ya da asiri sicaklik kesmesi
-   attiysa isitici calismaz. Bekleme suresinde enerji tasarrufu icin dusuk
-   ayar degeri. Durdurmada yeni paket alinmaz, firindakiler cikarilir
-   (kontrollu bosaltma); cikis tikaliyken firinda paket varsa isitici hemen
-   kapanir. Firin bosalinca fan, sicaklik dusene kadar sogutur.
+   Tunnel: +/- 3 C thermostat. If the fan is not running or the over-temperature
+   trip has tripped, the heater does not run. A lower setpoint is used during standby
+   to save energy. On stop no new pack is accepted and the packs inside are discharged
+   (controlled draining); if the outfeed is blocked and there are packs in the tunnel, the heater
+   switches off immediately. When the tunnel is empty the fan cools until the temperature drops.
 
-   Paket sayimi simulatorun giris/cikis sayaclariyla yapilir (fotosel
-   darbeleri 0,5 s gecikmede kacabilir).
+   Packs are counted with the simulator's infeed/outfeed counters (photoeye
+   pulses can be missed at a 0.5 s delay).
    ===================================================================== *)
 
 FUNCTION_BLOCK FB_Shrink
@@ -1791,10 +1791,10 @@ FUNCTION_BLOCK FB_Shrink
     COMM_FAULT : BOOL;
     IW_DI      : WORD;
     IW_LANE    : INT;
-    IW_TEMP    : INT;    (* 0,1 C *)
+    IW_TEMP    : INT;    (* 0.1 C *)
     IW_IN_CNT  : INT;
     IW_OUT_CNT : INT;
-    IW_FILM    : INT;    (* 0,1 % *)
+    IW_FILM    : INT;    (* 0.1 % *)
     IW_PADS    : INT;
     IW_PLATE   : WORD;
     IW_REJECT_CNT : INT;
@@ -1813,12 +1813,12 @@ FUNCTION_BLOCK FB_Shrink
   END_VAR
 
   VAR
-    (* ---- Recete (demo olcegi; POF film icin) ---------------------------- *)
+    (* ---- Recipe (demo scale; for POF film) ---------------------------- *)
     SP_RUN       : INT := 1600;   (* 160 C *)
-    SP_STANDBY   : INT := 1200;   (* 120 C, uzun beklemede *)
-    TEMP_BAND    : INT := 150;    (* hazir: ayar degeri +/- 15 C *)
+    SP_STANDBY   : INT := 1200;   (* 120 C, during long standby *)
+    TEMP_BAND    : INT := 150;    (* ready: setpoint +/- 15 C *)
     HYST         : INT := 30;     (* termostat +/- 3 C *)
-    COOL_OFF     : INT := 600;    (* fan 60 C altinda durur *)
+    COOL_OFF     : INT := 600;    (* fan stops below 60 C *)
     FILM_LOW     : INT := 100;    (* %10 *)
     ALARM_MASK   : WORD := WORD#16#63FF;
   END_VAR
@@ -1829,9 +1829,9 @@ FUNCTION_BLOCK FB_Shrink
     DI_FAN_RUN, DI_BELT_RUN, DI_OT_TRIP, DI_EXIT_FULL : BOOL;
 
     WAIT_START : BOOL := TRUE;
-    MODE       : INT := 0;    (* 0 dur, 1 calis, 3 alarm, 4 acil stop *)
-    G_STP      : INT := 0;    (* gruplama adimi *)
-    W_STP      : INT := 0;    (* sarma adimi *)
+    MODE       : INT := 0;    (* 0 stopped, 1 running, 3 alarm, 4 e-stop *)
+    G_STP      : INT := 0;    (* grouping step *)
+    W_STP      : INT := 0;    (* wrapping step *)
     ROWS       : INT := 0;
     PACKS      : INT := 0;
     INSIDE     : INT := 0;
@@ -1882,7 +1882,7 @@ FUNCTION_BLOCK FB_Shrink
     T_IDLE(IN := FALSE, PT := T#1s);
   END_IF;
 
-  (* =================== 1. Girisleri coz =================== *)
+  (* =================== 1. Decode inputs =================== *)
   DI_LANE_FULL    := (IW_DI AND WORD#16#0001) <> WORD#0;
   DI_ROWP_EXT     := (IW_DI AND WORD#16#0002) <> WORD#0;
   DI_ROWP_RET     := (IW_DI AND WORD#16#0004) <> WORD#0;
@@ -1906,7 +1906,7 @@ FUNCTION_BLOCK FB_Shrink
   RT_START(CLK := START);
   RT_RESET(CLK := RESET);
 
-  (* firindaki paket: giris sayaci - cikis sayaci (30000'de sifirlanma dahil) *)
+  (* packs in the tunnel: infeed counter - outfeed counter (including wrap-around at 30000) *)
   INSIDE := IW_IN_CNT - IW_OUT_CNT;
   IF INSIDE < 0 THEN INSIDE := INSIDE + 30000; END_IF;
 
@@ -1919,7 +1919,7 @@ FUNCTION_BLOCK FB_Shrink
 
   ROW_BLOCKED := MODE = 1 AND G_STP = 12 AND ROWS >= 2 AND IW_LANE > 0;
   IF ROW_BLOCKED THEN ALARMS := ALARMS OR WORD#16#4000; END_IF;
-  (* =================== 2. Alarmlar =================== *)
+  (* =================== 2. Alarms =================== *)
   IF NOT ESTOP_OK THEN ALARMS := ALARMS OR WORD#16#0001; END_IF;
   IF COMM_FAULT THEN ALARMS := ALARMS OR WORD#16#2000; END_IF;
   IF DI_OT_TRIP THEN ALARMS := ALARMS OR WORD#16#0040; END_IF;
@@ -1930,7 +1930,7 @@ FUNCTION_BLOCK FB_Shrink
   IF T_HEATUP.Q THEN ALARMS := ALARMS OR WORD#16#0020; END_IF;
   T_BELTFB(IN := Q_CONV AND NOT DI_BELT_RUN, PT := T#2s);
   IF T_BELTFB.Q THEN ALARMS := ALARMS OR WORD#16#0080; END_IF;
-  (* paket firinda sikisti: bant donuyor, cikis bos ama 15 s'dir firindan paket cikmiyor *)
+  (* pack jammed in the tunnel: belt is running, outfeed is empty, but no pack has left the tunnel for 15 s *)
   T_STUCK(IN := INSIDE > 0 AND DI_BELT_RUN AND NOT DI_EXIT_FULL AND IW_OUT_CNT = OUT_LAST, PT := T#15s);
   OUT_LAST := IW_OUT_CNT;
   IF T_STUCK.Q THEN ALARMS := ALARMS OR WORD#16#0100; END_IF;
@@ -1945,7 +1945,7 @@ FUNCTION_BLOCK FB_Shrink
     ALARMS := WORD#0;
     IF MODE = 3 OR MODE = 4 THEN
       MODE := 0;
-      (* yarim kalan hareketleri bastan al; sira sayisi korunur *)
+      (* restart the unfinished movements; the row count is kept *)
       IF G_STP = 1 THEN G_STP := 0; END_IF;
       IF G_STP >= 11 AND G_STP <= 13 THEN G_STP := 10; END_IF;
       IF G_STP >= 21 AND G_STP <= 22 THEN G_STP := 20; END_IF;
@@ -1957,15 +1957,15 @@ FUNCTION_BLOCK FB_Shrink
   IF MODE = 1 THEN WAIT_START := FALSE; END_IF;
   IF MODE = 1 AND NOT STOP_OK THEN MODE := 0; END_IF;
 
-  (* =================== 3. Firin =================== *)
-  (* 2 dakika yeni bardak gelmezse enerji tasarrufu; yeni bardak gelince normal ayara don *)
+  (* =================== 3. Shrink tunnel =================== *)
+  (* if no new cup arrives for 2 minutes, energy saving; return to the normal setpoint when a new cup arrives *)
   T_IDLE(IN := MODE = 1 AND G_STP = 10 AND IW_LANE = LANE_LAST AND INSIDE = 0 AND W_STP = 0, PT := T#120s);
   LANE_LAST := IW_LANE;
   STANDBY := T_IDLE.Q;
   IF STANDBY THEN SP := SP_STANDBY; ELSE SP := SP_RUN; END_IF;
   TEMP_READY := (IW_TEMP >= SP_RUN - TEMP_BAND) AND (IW_TEMP <= SP_RUN + TEMP_BAND);
 
-  (* cikis tikali ve firinda paket var: isitici hemen kapanir, paketler supheli *)
+  (* outfeed blocked and packs in the tunnel: heater switches off immediately, packs are suspect *)
   T_EXITBLK(IN := DI_EXIT_FULL AND INSIDE > 0, PT := T#3s);
   IF T_EXITBLK.Q THEN HEAT_BLOCK := TRUE; END_IF;
   IF NOT DI_EXIT_FULL THEN HEAT_BLOCK := FALSE; END_IF;
@@ -1980,18 +1980,18 @@ FUNCTION_BLOCK FB_Shrink
   ELSIF IW_TEMP > SP + HYST THEN
     Q_HEAT := FALSE;
   END_IF;
-  (* fan: calismada, bosaltmada ve firin sogumadan durmaz *)
+  (* fan: does not stop while running, draining, or before the tunnel has cooled *)
   Q_FAN := NOT WAIT_START AND ESTOP_OK AND (MODE = 1 OR DRAINING OR IW_TEMP > COOL_OFF);
   Q_CONV := ESTOP_OK AND (MODE = 1 OR DRAINING) AND (ALARMS AND WORD#16#0080) = WORD#0;
 
-  (* =================== 4. Gruplama =================== *)
+  (* =================== 4. Grouping =================== *)
   T_PAD(IN := G_STP = 1, PT := T#3s);
   T_GATE(IN := G_STP = 11, PT := T#600ms);
   T_MOVE(IN := MODE = 1 AND NOT ROW_BLOCKED AND (G_STP = 12 OR G_STP = 13 OR G_STP = 21 OR G_STP = 22), PT := T#3s);
 
   IF MODE = 1 AND GROUP_OK THEN
     CASE G_STP OF
-      0:  (* altlik *)
+      0:  (* pad *)
         IF DI_ROWP_RET AND DI_GRPP_RET THEN
           IF ROWS >= 2 THEN G_STP := 20;
           ELSIF DI_PAD THEN G_STP := 10;
@@ -2000,21 +2000,21 @@ FUNCTION_BLOCK FB_Shrink
         END_IF;
       1:
         IF DI_PAD THEN G_STP := 10; ELSIF T_PAD.Q THEN ALARMS := ALARMS OR WORD#16#0200; END_IF;
-      10: (* serit dolsun *)
+      10: (* let the lane fill *)
         IF ROWS >= 2 THEN G_STP := 20;
         ELSIF DI_LANE_FULL AND DI_ROWP_RET AND DI_GRPP_RET THEN G_STP := 11; END_IF;
-      11: (* giris kapisini kapat, strok bekle *)
+      11: (* close the infeed gate, wait for the stroke *)
         IF T_GATE.Q THEN G_STP := 12; END_IF;
-      12: (* sira iticisi ileri *)
+      12: (* row pusher forward *)
         IF DI_ROWP_EXT OR (ROWS >= 2 AND IW_LANE = 0) THEN G_STP := 13;
         ELSIF T_MOVE.Q THEN ALARMS := ALARMS OR WORD#16#0002; END_IF;
-      13: (* geri; sira ancak itici geri gelince sayilir *)
+      13: (* back; a row is counted only when the pusher is back *)
         IF DI_ROWP_RET THEN
           IF ROWS >= 2 THEN G_STP := 20; ELSE G_STP := 10; END_IF;
         ELSIF T_MOVE.Q THEN
           ALARMS := ALARMS OR WORD#16#0002;
         END_IF;
-      20: (* sarma makinesi bos ve hazir olunca grubu it *)
+      20: (* push the group when the wrapping machine is empty and ready *)
         IF ROWS = 0 THEN G_STP := 0;
         ELSIF ROWS >= 2 AND DI_WRAP_READY AND DI_ROWP_RET AND DI_GRPP_RET THEN G_STP := 21; END_IF;
       21:
@@ -2024,7 +2024,7 @@ FUNCTION_BLOCK FB_Shrink
     END_CASE;
   END_IF;
 
-  (* =================== 5. Sarma ve birakma =================== *)
+  (* =================== 5. Wrapping and release =================== *)
   T_WRAP(IN := W_STP = 1, PT := T#6s);
   REL_OK := MODE = 1 AND TEMP_READY AND NOT STANDBY AND NOT DI_EXIT_FULL AND DI_BELT_RUN AND NOT HEAT_BLOCK;
   IF MODE = 1 THEN
@@ -2047,7 +2047,7 @@ FUNCTION_BLOCK FB_Shrink
     END_CASE;
   END_IF;
 
-  (* =================== 6. Cikislar =================== *)
+  (* =================== 6. Outputs =================== *)
   Q_PAD  := MODE = 1 AND G_STP = 1;
   Q_GATE := G_STP >= 11 AND G_STP <= 13 AND MODE <> 4;
   Q_ROW  := MODE = 1 AND G_STP = 12 AND ROWS < 2;
@@ -2074,7 +2074,7 @@ FUNCTION_BLOCK FB_Shrink
   IF DI_PAD_LOW THEN WARNS := WARNS OR WORD#16#1000; END_IF;
   QW_ALARM := ALARMS OR WARNS;
 
-  (* durum kodu ve PackML benzeri durum bitleri *)
+  (* state code and PackML-like status bits *)
   IF MODE = 4 THEN
     QW_STATE := 9;
   ELSIF MODE = 3 THEN
@@ -2126,19 +2126,19 @@ END_FUNCTION_BLOCK
 
 
 (* =====================================================================
-   FB_Tank - tank, transfer hatti ve CIP (fabrikanin 2. blogu)
+   FB_Tank - tank, transfer line and CIP (block 2 of the factory)
 
-   Hat: kaynaklar V_PROD / V_WATER / V_CAUSTIC -> pompa P1 -> debimetre FT1
-        -> hedefler V_FILL (dolum tanki) / V_DRAIN (gider) / V_CIPRET (kostik tanki)
+   Line: sources V_PROD / V_WATER / V_CAUSTIC -> pump P1 -> flow meter FT1
+        -> destinations V_FILL (filling tank) / V_DRAIN (drain) / V_CIPRET (caustic tank)
 
-   Rota yoneticisi: her rota degisiminde pompa durur, yeni rotada olmayan
-   butun vanalarin KAPALI oldugu sinir anahtarlariyla kanitlanir, yeni rota
-   acilir, vana strok suresi beklenir, pompa yeniden kalkar. Rotada olmayan
-   bir vana acik gorunurse pompa durur ve alarm verilir. Boylece kostik ve
-   urun ayni anda ayni hatta bulunamaz.
+   Route manager: on every route change the pump stops, limit switches prove that
+   all valves not in the new route are CLOSED, the new route
+   is opened, the valve stroke time is waited out, and the pump starts again. If a valve not in
+   the route appears open, the pump stops and an alarm is raised. This way caustic and
+   product can never be in the same line at the same time.
 
-   Dolum makinesi urun ister (REQ); bu blok aktarir ya da sebebini bildirir.
-   Sureler demo olcegindedir (gercek CIP'te kostik temas suresi 10-20 dk).
+   The filling machine requests product (REQ); this block transfers it or reports the reason it cannot.
+   Times are at demo scale (in a real CIP the caustic contact time is 10-20 min).
    ===================================================================== *)
 
 FUNCTION_BLOCK FB_Tank
@@ -2148,18 +2148,18 @@ FUNCTION_BLOCK FB_Tank
   VAR_INPUT
     RESTART : BOOL;
     START : BOOL;
-    ESTOP_OK, RESET : BOOL;   (* fabrika paneli *)
+    ESTOP_OK, RESET : BOOL;   (* factory panel *)
     IO_READY   : BOOL;
     COMM_FAULT : BOOL;
-    REQ        : BOOL;        (* dolum makinesi urun istiyor *)
+    REQ        : BOOL;        (* the filling machine wants product *)
     IW_DI      : WORD;
-    IW_T1_LVL  : INT;         (* 0,1 % *)
-    IW_FLOW    : INT;         (* 0,01 kg/s *)
-    IW_TOTAL   : INT;         (* 0,1 kg, 30000'de sifirlanir *)
-    IW_COND    : INT;         (* 0,1 mS/cm, 25 C'ye duzeltilmis *)
-    IW_RET_T   : INT;         (* 0,1 C *)
-    IW_CIP_T   : INT;         (* 0,1 C *)
-    IW_CIP_LVL : INT;         (* 0,1 % *)
+    IW_T1_LVL  : INT;         (* 0.1 % *)
+    IW_FLOW    : INT;         (* 0.01 kg/s *)
+    IW_TOTAL   : INT;         (* 0.1 kg, wraps to zero at 30000 *)
+    IW_COND    : INT;         (* 0.1 mS/cm, corrected to 25 C *)
+    IW_RET_T   : INT;         (* 0.1 C *)
+    IW_CIP_T   : INT;         (* 0.1 C *)
+    IW_CIP_LVL : INT;         (* 0.1 % *)
   END_VAR
   VAR_OUTPUT
     QW_STATUS : WORD;
@@ -2179,38 +2179,38 @@ FUNCTION_BLOCK FB_Tank
   END_VAR
 
   VAR
-    (* ---- Recete ve ayarlar (demo olcegi) ------------------------------ *)
-    COND_MIN      : INT := 85;     (* urun penceresi 8,5..9,5 mS/cm (~%5 su icerir) *)
+    (* ---- Recipe and settings (demo scale) ------------------------------ *)
+    COND_MIN      : INT := 85;     (* product window 8.5..9.5 mS/cm (contains ~5% water) *)
     COND_MAX      : INT := 95;
-    COND_CAUSTIC  : INT := 650;    (* etkili kostik: >= 65 mS/cm (~%80 derisim); donuse ancak bu derisimde *)
-    RINSE_MARGIN  : INT := 5;      (* son durulama: giris suyu + 0,5 mS/cm *)
-    FLOW_MIN      : INT := 50;     (* 0,5 kg/s *)
-    FLOW_CIP      : INT := 150;    (* CIP icin 1,5 kg/s *)
-    CIP_TEMP_MIN  : INT := 700;    (* donus sicakligi >= 70 C *)
+    COND_CAUSTIC  : INT := 650;    (* effective caustic: >= 65 mS/cm (~80% concentration); sent to the return only at this concentration *)
+    RINSE_MARGIN  : INT := 5;      (* final rinse: inlet water + 0.5 mS/cm *)
+    FLOW_MIN      : INT := 50;     (* 0.5 kg/s *)
+    FLOW_CIP      : INT := 150;    (* 1.5 kg/s for CIP *)
+    CIP_TEMP_MIN  : INT := 700;    (* return temperature >= 70 C *)
     CAUSTIC_SP    : INT := 780;
     CAUSTIC_MAX   : INT := 900;
     CIP_LVL_MIN   : INT := 300;
-    RINSE_KG      : INT := 300;    (* her durulama 30 kg su *)
-    CIP_LIMIT     : INT := 500;    (* 50 kg uretimde bir CIP *)
-    ALARM_MASK    : WORD := WORD#16#23FF;   (* bit 0-9 ve 13 alarm, 10-12 uyari *)
+    RINSE_KG      : INT := 300;    (* 30 kg of water per rinse *)
+    CIP_LIMIT     : INT := 500;    (* one CIP per 50 kg of production *)
+    ALARM_MASK    : WORD := WORD#16#23FF;   (* bits 0-9 and 13 are alarms, 10-12 are warnings *)
   END_VAR
 
   VAR
-    (* ---- Cozulmus girisler ------------------------------------------- *)
+    (* ---- Decoded inputs ------------------------------------------- *)
     DI_T1_LOW, DI_CIP_START, DI_CIP_ABORT, DI_P1_RUN, DI_P1_TRIP, DI_LEAK : BOOL;
-    CLOSED   : WORD;   (* DO bitleriyle hizali: bit1 V_PROD .. bit6 V_CIPRET *)
+    CLOSED   : WORD;   (* aligned with the DO bits: bit1 V_PROD .. bit6 V_CIPRET *)
 
-    (* ---- Rota yoneticisi ---------------------------------------------- *)
-    WANT     : WORD;   (* adimin istedigi rota *)
-    CUR      : WORD;   (* kanitlanmis, uygulanan rota *)
-    VALVES   : WORD;   (* vanalara giden komut *)
-    RSTATE       : INT;    (* 0 kararli, 1 kapatiliyor, 2 aciliyor *)
+    (* ---- Route manager ---------------------------------------------- *)
+    WANT     : WORD;   (* route requested by the step *)
+    CUR      : WORD;   (* proven, applied route *)
+    VALVES   : WORD;   (* command to the valves *)
+    RSTATE       : INT;    (* 0 stable, 1 closing, 2 opening *)
     PUMP_REQ : BOOL;
     Q_P1     : BOOL;
     Q_HEAT   : BOOL;
-    ROUTE_OK : BOOL;   (* rotada olmayan butun vanalar kapali *)
+    ROUTE_OK : BOOL;   (* all valves not in the route are closed *)
 
-    (* ---- Durum -------------------------------------------------------- *)
+    (* ---- State -------------------------------------------------------- *)
     WAIT_START : BOOL := TRUE;
     MODE : INT := 0;
     RT_START : R_TRIG;
@@ -2222,9 +2222,9 @@ FUNCTION_BLOCK FB_Tank
     ALARMS      : WORD;
     WARNS       : WORD;
     ABORT_WARN  : BOOL;
-    LINE_PRODUCT : BOOL;   (* hat urunle dolu ve dogrulanmis *)
-    CIP_REQ     : BOOL;    (* operator CIP istedi; aktarim bitince baslar *)
-    CAUSTIC_IN  : BOOL;    (* kostik donuse yonlendirildi *)
+    LINE_PRODUCT : BOOL;   (* line is full of product and verified *)
+    CIP_REQ     : BOOL;    (* the operator requested CIP; starts when the transfer ends *)
+    CAUSTIC_IN  : BOOL;    (* caustic was routed to the return *)
     COND_OK     : BOOL;
     HOLD_OK     : BOOL;
     STEP_TO     : BOOL;
@@ -2241,7 +2241,7 @@ FUNCTION_BLOCK FB_Tank
     FINAL_COND  : INT;
     CIP_DUR     : INT;
 
-    (* ---- Zamanlayicilar (matiec: her biri ayri satirda) --------------- *)
+    (* ---- Timers (matiec: each on a separate line) --------------- *)
     RT_CIPSTART : R_TRIG;
     RT_CIPABORT : R_TRIG;
     RT_RESET    : R_TRIG;
@@ -2276,14 +2276,14 @@ FUNCTION_BLOCK FB_Tank
     T_STALE(IN := FALSE, PT := T#1s);
   END_IF;
 
-  (* =================== 1. Girisleri coz =================== *)
+  (* =================== 1. Decode inputs =================== *)
   DI_T1_LOW    := (IW_DI AND WORD#16#0001) <> WORD#0;
   DI_CIP_START := (IW_DI AND WORD#16#0002) <> WORD#0;
   DI_CIP_ABORT := (IW_DI AND WORD#16#0004) <> WORD#0;
   DI_P1_RUN    := (IW_DI AND WORD#16#0008) <> WORD#0;
   DI_P1_TRIP   := (IW_DI AND WORD#16#0010) <> WORD#0;
   DI_LEAK      := (IW_DI AND WORD#16#0800) <> WORD#0;
-  (* kapali sinir anahtarlari DI bit 5..10; 4 bit saga kaydirinca DO bit 1..6 ile hizalanir *)
+  (* closed limit switches are DI bits 5..10; shifted right by 4 bits they align with DO bits 1..6 *)
   CLOSED := SHR(IW_DI, 4) AND WORD#16#007E;
 
   RT_CIPSTART(CLK := DI_CIP_START);
@@ -2292,7 +2292,7 @@ FUNCTION_BLOCK FB_Tank
   RT_START(CLK := START);
   IF RT_START.Q AND IO_READY AND NOT RESTART THEN WAIT_START := FALSE; MODE := 1; END_IF;
 
-  (* debimetre toplayicisindan bu taramadaki artis (30000'de sifirlanma dahil) *)
+  (* increase of the flow meter totalizer in this scan (including wrap-around at 30000) *)
   IF NOT TOTAL_INIT THEN TOTAL_LAST := IW_TOTAL; TOTAL_INIT := IO_READY; END_IF;
   D_TOTAL := IW_TOTAL - TOTAL_LAST;
   IF D_TOTAL < 0 THEN D_TOTAL := D_TOTAL + 30000; END_IF;
@@ -2300,13 +2300,13 @@ FUNCTION_BLOCK FB_Tank
 
   COND_OK := (IW_COND >= COND_MIN) AND (IW_COND <= COND_MAX);
 
-  (* =================== 2. Guvenlik ve alarmlar =================== *)
+  (* =================== 2. Safety and alarms =================== *)
   IF NOT ESTOP_OK THEN ALARMS := ALARMS OR WORD#16#0001; END_IF;
-  IF COMM_FAULT THEN ALARMS := ALARMS OR WORD#16#2000; END_IF;   (* haberlesme yoksa guvenli dur *)
+  IF COMM_FAULT THEN ALARMS := ALARMS OR WORD#16#2000; END_IF;   (* no communication: stop safely *)
   IF DI_P1_TRIP THEN ALARMS := ALARMS OR WORD#16#0020; END_IF;
   IF DI_LEAK THEN ALARMS := ALARMS OR WORD#16#0010; END_IF;
 
-  (* rotada olmayan bir vana 1 s boyunca kapali gorunmuyorsa: vana takili ya da kacak *)
+  (* if a valve not in the route does not read closed for 1 s: valve stuck or leaking *)
   ROUTE_OK := ((NOT CUR) AND WORD#16#007E AND (NOT CLOSED)) = WORD#0;
   T_LEAKVAL(IN := RSTATE = 0 AND NOT ROUTE_OK, PT := T#1s);
   IF T_LEAKVAL.Q THEN ALARMS := ALARMS OR WORD#16#0008; END_IF;
@@ -2320,7 +2320,7 @@ FUNCTION_BLOCK FB_Tank
 
   IF NOT IO_READY THEN ALARMS := ALARMS_BEFORE; END_IF;
 
-  (* alarm: her sey kapanir; CIP sirasindaysa CIP basarisiz sayilir *)
+  (* alarm: everything shuts down; if a CIP is in progress it counts as failed *)
   IF (ALARMS AND ALARM_MASK) <> WORD#0 THEN
     IF STP >= 40 THEN CIP_RES := 3; CIP_DUE := TRUE; LINE_PRODUCT := FALSE; END_IF;
     STP := 0;
@@ -2332,27 +2332,27 @@ FUNCTION_BLOCK FB_Tank
     END_IF;
   END_IF;
 
-  (* =================== 3. Adimlar =================== *)
-  (* not: STEP ve RS IEC 61131-3 ayrilmis sozcukleri (SFC adimi, RS flip-flop); STP / RSTATE kullanildi *)
+  (* =================== 3. Steps =================== *)
+  (* note: STEP and RS are IEC 61131-3 reserved words (SFC step, RS flip-flop); STP / RSTATE are used instead *)
   IF STP <> LAST_STP THEN STEP_SCANS := 0; VOL := 0; END_IF;
   LAST_STP := STP;
   IF STEP_SCANS < 30000 THEN STEP_SCANS := STEP_SCANS + 1; END_IF;
   IF RSTATE = 0 AND (STP = 42 OR STP = 44) THEN VOL := VOL + D_TOTAL; END_IF;
 
-  (* uretim icin uygulanan rotadan gecen miktar *)
+  (* quantity passed through the route applied for production *)
   IF CUR = WORD#16#0012 OR CUR = WORD#16#0022 THEN
     IF SINCE < 30000 THEN SINCE := SINCE + D_TOTAL; END_IF;
   END_IF;
   IF CUR = WORD#16#0012 THEN BATCH := BATCH + D_TOTAL; END_IF;
   IF SINCE >= CIP_LIMIT THEN CIP_DUE := TRUE; END_IF;
 
-  (* hatta uzun sure bekleyen urun bayatlar: tekrar push-out gerekir *)
+  (* product waiting in the line for a long time goes stale: a push-out is needed again *)
   T_STALE(IN := STP = 0 AND LINE_PRODUCT, PT := T#1200s);
   IF T_STALE.Q THEN LINE_PRODUCT := FALSE; END_IF;
 
   IF RT_CIPSTART.Q THEN CIP_REQ := TRUE; END_IF;
 
-  (* CIP iptali *)
+  (* CIP abort *)
   IF RT_CIPABORT.Q AND STP >= 40 THEN
     CIP_RES := 2;
     CIP_DUE := TRUE;
@@ -2367,10 +2367,10 @@ FUNCTION_BLOCK FB_Tank
   HOLD_OK := STP = 43 AND RSTATE = 0 AND CUR = WORD#16#0048 AND Q_P1
              AND IW_COND >= COND_CAUSTIC AND IW_RET_T >= CIP_TEMP_MIN AND IW_FLOW >= FLOW_CIP;
   T_HOLD(IN := HOLD_OK, PT := T#30s);
-  STEP_TO := STEP_SCANS >= 15000;     (* 300 s; 20 ms gorev suresiyle *)
+  STEP_TO := STEP_SCANS >= 15000;     (* 300 s; with a 20 ms task cycle *)
 
   CASE STP OF
-    0:  (* bekleme *)
+    0:  (* idle *)
       WANT := WORD#0;
       PUMP_REQ := FALSE;
       IF NOT WAIT_START AND (ALARMS AND ALARM_MASK) = WORD#0 THEN
@@ -2383,17 +2383,17 @@ FUNCTION_BLOCK FB_Tank
         END_IF;
       END_IF;
 
-    20: (* hatti urunle doldur: ilk sivi gidere *)
+    20: (* fill the line with product: first liquid to the drain *)
       WANT := WORD#16#0022;            (* V_PROD + V_DRAIN *)
       PUMP_REQ := TRUE;
       IF T_INWIN.Q THEN
         LINE_PRODUCT := TRUE;
-        STP := 10;                     (* rota yoneticisi pompayi durdurup rotayi degistirir *)
+        STP := 10;                     (* the route manager stops the pump and changes the route *)
       ELSIF STEP_SCANS > 2250 THEN
-        ALARMS := ALARMS OR WORD#16#0200;   (* 45 s'de urun iletkenligi yakalanamadi *)
+        ALARMS := ALARMS OR WORD#16#0200;   (* product conductivity not detected within 45 s *)
       END_IF;
 
-    10: (* dolum tankina aktar *)
+    10: (* transfer to the filling tank *)
       WANT := WORD#16#0012;            (* V_PROD + V_FILL *)
       PUMP_REQ := TRUE;
       IF T_FOREIGN.Q THEN
@@ -2403,7 +2403,7 @@ FUNCTION_BLOCK FB_Tank
         STP := 0;
       END_IF;
 
-    40: (* CIP hazirlik: hat bos rota, butun vanalar kapali kanitlansin *)
+    40: (* CIP preparation: empty route for the line, prove all valves closed *)
       WANT := WORD#0;
       PUMP_REQ := FALSE;
       LINE_PRODUCT := FALSE;
@@ -2418,7 +2418,7 @@ FUNCTION_BLOCK FB_Tank
         STP := 41;
       END_IF;
 
-    41: (* kostik sicakligini bekle *)
+    41: (* wait for the caustic temperature *)
       WANT := WORD#0;
       PUMP_REQ := FALSE;
       IF IW_CIP_T >= CAUSTIC_SP - 50 THEN
@@ -2427,17 +2427,17 @@ FUNCTION_BLOCK FB_Tank
         ALARMS := ALARMS OR WORD#16#0080;
       END_IF;
 
-    42: (* on durulama: su gidere *)
+    42: (* pre-rinse: water to the drain *)
       WANT := WORD#16#0024;            (* V_WATER + V_DRAIN *)
       PUMP_REQ := TRUE;
       IF VOL >= RINSE_KG THEN
-        WATER_REF := IW_COND;           (* giris suyunun iletkenligi: son durulamanin olcutu *)
+        WATER_REF := IW_COND;           (* conductivity of the inlet water: the criterion for the final rinse *)
         STP := 43;
       ELSIF STEP_TO THEN
         ALARMS := ALARMS OR WORD#16#0080;
       END_IF;
 
-    43: (* kostik: once gidere, kostik gelince kostik tankina (faz ayirma) *)
+    43: (* caustic: first to the drain, to the caustic tank once caustic arrives (phase separation) *)
       PUMP_REQ := TRUE;
       IF NOT CAUSTIC_IN AND RSTATE = 0 AND IW_COND >= COND_CAUSTIC THEN CAUSTIC_IN := TRUE; END_IF;
       IF CAUSTIC_IN THEN
@@ -2445,7 +2445,7 @@ FUNCTION_BLOCK FB_Tank
       ELSE
         WANT := WORD#16#0028;          (* V_CAUSTIC + V_DRAIN *)
       END_IF;
-      (* CIP kaydi: sayilan tutma penceresindeki en dusuk degerler *)
+      (* CIP record: the lowest values in the counted hold window *)
       IF HOLD_OK THEN
         IF IW_RET_T < MIN_T THEN MIN_T := IW_RET_T; END_IF;
         IF IW_FLOW < MIN_F THEN MIN_F := IW_FLOW; END_IF;
@@ -2459,7 +2459,7 @@ FUNCTION_BLOCK FB_Tank
         ALARMS := ALARMS OR WORD#16#0080;
       END_IF;
 
-    44: (* son durulama: kostik kalmayana kadar *)
+    44: (* final rinse: until no caustic is left *)
       WANT := WORD#16#0024;
       PUMP_REQ := TRUE;
       IF VOL >= RINSE_KG AND IW_COND <= WATER_REF + RINSE_MARGIN THEN
@@ -2469,7 +2469,7 @@ FUNCTION_BLOCK FB_Tank
         ALARMS := ALARMS OR WORD#16#0080;
       END_IF;
 
-    45: (* tamamlandi *)
+    45: (* completed *)
       WANT := WORD#0;
       PUMP_REQ := FALSE;
       SINCE := 0;
@@ -2482,13 +2482,13 @@ FUNCTION_BLOCK FB_Tank
   IF STP >= 40 AND STP <= 44 AND CIP_SCANS < 30000 THEN CIP_SCANS := CIP_SCANS + 1; END_IF;
   IF CIP_RES = 2 OR CIP_RES = 3 THEN CIP_DUR := CIP_SCANS / 50; END_IF;
 
-  (* =================== 4. Rota yoneticisi =================== *)
+  (* =================== 4. Route manager =================== *)
   IF (ALARMS AND ALARM_MASK) <> WORD#0 THEN WANT := WORD#0; END_IF;
   IF WANT <> CUR AND RSTATE = 0 THEN RSTATE := 1; END_IF;
   T_ROUTE(IN := RSTATE = 1, PT := T#3s);
   T_STROKE(IN := RSTATE = 2, PT := T#1s);
   IF RSTATE = 1 THEN
-    VALVES := CUR AND WANT;            (* yeni rotada olmayanlari kapat *)
+    VALVES := CUR AND WANT;            (* close the ones not in the new route *)
     IF ((NOT WANT) AND WORD#16#007E AND (NOT CLOSED)) = WORD#0 THEN
       RSTATE := 2;
     ELSIF T_ROUTE.Q THEN
@@ -2506,7 +2506,7 @@ FUNCTION_BLOCK FB_Tank
   Q_P1 := PUMP_REQ AND RSTATE = 0 AND CUR = WANT AND CUR <> WORD#0 AND ROUTE_OK
           AND (ALARMS AND ALARM_MASK) = WORD#0;
 
-  (* kostik tanki termostati (+/- 2 C), seviye ve asiri sicaklik kilidi *)
+  (* caustic tank thermostat (+/- 2 C), level and over-temperature interlock *)
   IF NOT ESTOP_OK OR IW_CIP_LVL < CIP_LVL_MIN OR IW_CIP_T > CAUSTIC_MAX THEN
     Q_HEAT := FALSE;
   ELSIF IW_CIP_T < CAUSTIC_SP - 20 THEN
@@ -2515,7 +2515,7 @@ FUNCTION_BLOCK FB_Tank
     Q_HEAT := FALSE;
   END_IF;
 
-  (* =================== 5. Cikislar =================== *)
+  (* =================== 5. Outputs =================== *)
   WARNS := WORD#0;
   IF DI_T1_LOW THEN WARNS := WARNS OR WORD#16#0400; END_IF;
   IF CIP_DUE THEN WARNS := WARNS OR WORD#16#0800; END_IF;
@@ -2657,13 +2657,13 @@ PROGRAM Lojistik
   END_VAR
 
   VAR
-    PB_START    : BOOL;   (* fabrika paneli *)
+    PB_START    : BOOL;   (* factory panel *)
     PB_STOP_OK  : BOOL;
     PB_ESTOP_OK : BOOL;
     PB_RESET    : BOOL;
     FIRST_SCAN  : BOOL := TRUE;
     RESTART     : BOOL;
-    IO_READY    : BOOL;   (* simulatorden dogru surumde ilk veri geldi *)
+    IO_READY    : BOOL;   (* first data arrived from the simulator with the correct version *)
     COMM_FAULT  : BOOL;
     SIM_HB_LAST : INT;
     PLC_HB      : INT;
@@ -2672,29 +2672,29 @@ PROGRAM Lojistik
     ASRS        : FB_Asrs;
   END_VAR
 
-  (* =================== 1. Fabrika paneli =================== *)
+  (* =================== 1. Factory panel =================== *)
   PB_START    := (FAB_IW_DI AND WORD#16#0001) <> WORD#0;
   PB_STOP_OK  := (FAB_IW_DI AND WORD#16#0002) <> WORD#0;
   PB_ESTOP_OK := (FAB_IW_DI AND WORD#16#0004) <> WORD#0;
   PB_RESET    := (FAB_IW_DI AND WORD#16#0008) <> WORD#0;
 
-  (* =================== 2. Haberlesme bekcisi =================== *)
-  (* simulator kalp atisi 2 s degismezse haberlesme arizasi *)
+  (* =================== 2. Communication watchdog =================== *)
+  (* communication fault if the simulator heartbeat does not change for 2 s *)
   T_SIMHB(IN := (FAB_IW_SIM_HB = SIM_HB_LAST), PT := T#2s);
   SIM_HB_LAST := FAB_IW_SIM_HB;
   COMM_FAULT := T_SIMHB.Q;
-  (* ilk veri gelene ve harita surumu tutana kadar girisler gecersiz *)
+  (* inputs are invalid until the first data arrives and the map version matches *)
   IF FAB_IW_SIM_HB <> 0 AND FAB_IW_MAPVER = 7 THEN IO_READY := TRUE; END_IF;
 
   RESTART := FIRST_SCAN AND IO_READY;
   IF RESTART THEN FIRST_SCAN := FALSE; END_IF;
 
-  (* PLC kalp atisi: simulator bunu izler, program durursa bu PLC'nin cikislarini kapatir *)
+  (* PLC heartbeat: the simulator watches it and switches off this PLC's outputs if the program stops *)
   PLC_HB := PLC_HB + 1;
   IF PLC_HB > 30000 THEN PLC_HB := 0; END_IF;
 
-  (* =================== Otomatik depo =================== *)
-  (* giris konveyoru AGV catallari disaridayken calisir *)
+  (* =================== Automated cold store =================== *)
+  (* the inbound conveyor runs only while the AGV forks are outside *)
   ASRS(START := PB_START, STOP_OK := PB_STOP_OK, ESTOP_OK := PB_ESTOP_OK, RESET := PB_RESET,
        RESTART := RESTART, IO_READY := IO_READY, COMM_FAULT := COMM_FAULT,
        IW_DI := ASRS_IW_DI, IW_ACK_SEQ := ASRS_IW_ACK_SEQ, IW_RES_SEQ := ASRS_IW_RES_SEQ,
@@ -2718,9 +2718,9 @@ PROGRAM Lojistik
   ASRS_QW_NEXT_ID := ASRS.QW_NEXT_ID;
 
   (* =================== AGV =================== *)
-  (* paletleme hucresi ve depo izinlerine gore tasir. "Alim noktasinda palet hazir":
-     tek PLC'de dogrudan PALLET.PICKUP_RDY, bolunmus modda paketleme PLC'sinin PAL_QW_DO bit 11
-     cikisindan gelen kablo (AGV_IW_IL bit 0). *)
+  (* moves pallets according to the palletizing cell and cold store permissions. "Pallet ready at the
+     pickup point": in a single PLC, PALLET.PICKUP_RDY directly; in split mode, the wire from the
+     packaging PLC's PAL_QW_DO bit 11 output (AGV_IW_IL bit 0). *)
   AGV(START := PB_START, STOP_OK := PB_STOP_OK, ESTOP_OK := PB_ESTOP_OK, RESET := PB_RESET,
       RESTART := RESTART, IO_READY := IO_READY, COMM_FAULT := COMM_FAULT,
       IW_DI := AGV_IW_DI, IW_ACK_SEQ := AGV_IW_ACK_SEQ, IW_RES_SEQ := AGV_IW_RES_SEQ,
