@@ -153,7 +153,7 @@ ROLE=paketleme ./plc/openplc/run_ayran.sh   # or just one role of the three-PLC 
 To set it up by hand in the web UI: upload `plc/build/fabrika.st`, then add a Generic Modbus TCP slave device (ID 1, port 5020, Input Registers start 0 size 112, Holding Registers - Write start 0 size 112).
 
 Things to know:
-- matiec (OpenPLC's ST compiler) crashes **without an error message** on non-ASCII characters in comments and on a long list of TON instances declared on one line. That is why the ST comments are ASCII-only Turkish and every timer is on its own line. `npm run build:plc` catches both cases, and the reserved words `STEP` and `RS`, before compiling.
+- matiec (OpenPLC's ST compiler) crashes **without an error message** on non-ASCII characters in comments and on a long list of TON instances declared on one line. That is why the ST comments are ASCII-only and every timer is on its own line. `npm run build:plc` catches both cases, and the reserved words `STEP` and `RS`, before compiling.
 - WSL shuts Ubuntu down a few seconds after the last session closes, and the PLC stops with it. Keep an Ubuntu terminal open.
 
 ### CODESYS Control Win V3
@@ -235,7 +235,7 @@ test/                  Accelerated end-to-end scenarios and unit tests
 docs/tasarim/          Design notes and review reports (Turkish)
 ```
 
-A note on names: the function blocks and the role programs carry Turkish names (Dolum = filling, Paketleme = packaging, Lojistik = logistics, Ortak = common), and the ST comments are Turkish in ASCII. Almost all variable and signal names are English (signal prefixes such as `DOL_` for the filler are short Turkish cell names).
+A note on names: the ST comments are in English, but the function blocks and the role programs carry Turkish names (Dolum = filling, Paketleme = packaging, Lojistik = logistics, Ortak = common). The comments in the JavaScript ports and the simulator are still mostly Turkish. Almost all variable and signal names are English (signal prefixes such as `DOL_` for the filler are short Turkish cell names).
 
 ## Built with
 
